@@ -6,13 +6,14 @@ import torch
 import wandb
 from packaging import version
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
+from dataclasses import dataclass, field
 from Customtrainer.EpochBasedTrainer import EpochBasedTrainer
 from Customtrainer.IterBasedTrainer import IterBasedTrainer
 from Customtrainer.optimizer import build_optimizer
 from Customtrainer.utils import (
     CustomTrainerConfigError,
     TrainConfig,
+    ModelConfig,
     deepspeed_init_distributed,
     init_distributed,
     setup_logger,
@@ -23,6 +24,16 @@ from Customtrainer.utils import (
 )
 
 logger = logging.getLogger("train")
+
+
+@dataclass
+class CustomModelConfig(ModelConfig):
+    name: str = "gpt2"
+
+
+@dataclass
+class CustomTrainConfig(TrainConfig):
+    model: CustomModelConfig = field(default_factory=CustomModelConfig)
 
 
 def main(config: TrainConfig):
@@ -52,8 +63,12 @@ def main(config: TrainConfig):
     if hasattr(model, "num_params"):
         logger.info(f"Model has {model.num_params()} parameters")
 
-    if hasattr(model, "active_gradient_checkpointing") and config.activation_checkpointing:
-        model.active_gradient_checkpointing()
+    if hasattr(model, "num_params"):
+        logger.info(f"Model has {model.num_params()} parameters")
+
+    if hasattr(model, "gradient_checkpointing_enable") and config.activation_checkpointing:
+        model.gradient_checkpointing_enable()
+        model.enalbe_input_requre_grads()
 
     if config.fsdp.enabled:
         if hasattr(model, "get_fsdp_wrap_policy"):
@@ -166,7 +181,7 @@ if __name__ == "__main__":
     except IndexError:
         raise CustomTrainerConfigError(f"Usage: {sys.argv[0]} CONFIG_PATH [OTHER_ARGS]")
 
-    config = TrainConfig.load(config_path, other_args)
+    config = CustomTrainConfig.load(config_path, other_args)
 
     if config.deepspeed.enabled:
         config.rank, config.local_rank, config.world_size = deepspeed_init_distributed()

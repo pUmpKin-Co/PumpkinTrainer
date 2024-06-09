@@ -426,6 +426,7 @@ class SaveStrategy(StrEnum):
     step = "step"
 
 
+@dataclass
 class CheckpointConfig(BaseConfig):
     save_strategy: SaveStrategy = SaveStrategy.step
     """

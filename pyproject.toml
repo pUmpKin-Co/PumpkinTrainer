@@ -22,7 +22,8 @@ dependencies = [
     "omegaconf",
     "torchvision",
     "timm",
-    "safetensors"
+    "safetensors",
+    "tensorboard",
 ]
 
 [project.urls]

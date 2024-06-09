@@ -11,7 +11,7 @@ import torch.distributed as torch_dist
 from torch import Tensor
 from torch._C._distributed_c10d import ProcessGroup
 
-from error_message import CustomTrainerConfigError
+from .error_message import CustomTrainerConfigError
 from .config_parser import FSDPWrapStrategy
 
 logger = logging.getLogger("train")
