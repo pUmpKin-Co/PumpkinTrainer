@@ -1,7 +1,7 @@
 import logging
 from typing import List
 
-from .hook import HookBase, LoggerHook
+from .hook import DistributedHook, HookBase, LoggerHook
 from .trainer import Trainer
 from .utils import collect_env, is_main_process
 
@@ -46,6 +46,9 @@ class IterBasedTrainer(Trainer):
             self.build_ckpt_hook(),
             LoggerHook(self._log_period, tb_log_dir=self.tb_log_dir, use_wandb=self.wandb),
         ]
+
+    def get_specific_hooks(self) -> List[HookBase]:
+        return [DistributedHook()]
 
     def load_cur_stat(self, value):
         self.inner_iter = value

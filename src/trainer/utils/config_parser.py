@@ -225,7 +225,7 @@ class SchedulerConfig(BaseConfig):
 
 @dataclass
 class DataConfig(BaseConfig):
-    paths: Optional[List[str]] = None
+    paths: Optional[str] = None
     num_workers: int = 0
     drop_last: bool = False
     pin_memory: bool = False
@@ -699,6 +699,11 @@ class TrainConfig(BaseConfig):
     ["cuda", "cpu", "mps"]
     """
 
+    local_rank: Optional[int] = None
+    """
+    The local rank of the process.
+    """
+
     @property
     def accelerator(self) -> str:
         if self.accelerator_type == "cuda":
@@ -712,9 +717,9 @@ class TrainConfig(BaseConfig):
 
     @property
     def autocast_precision(self) -> torch.dtype:
-        if self.precision == "amp_bf16":
+        if self.precision == "bf16":
             return torch.bfloat16
-        elif self.precision == "amp_fp16":
+        elif self.precision == "fp16":
             return torch.float16
         elif self.precision == "fp32":
             return torch.float32
@@ -801,5 +806,6 @@ class TrainConfig(BaseConfig):
             ds_config["zero_optimization"] = zero_optimization
             ds_config["gradient_accumulation_steps"] = self.gradient_accumulation_steps
             ds_config["gradient_clipping"] = self.max_grad_norm
+            ds_config["train_micro_batch_size_per_gpu"] = self.device_train_batch_size
 
         return ds_config

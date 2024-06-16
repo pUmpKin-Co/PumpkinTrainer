@@ -1,27 +1,30 @@
 import logging
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
 import wandb
 from packaging import version
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from dataclasses import dataclass, field
+from src.data.build_data import build_loader
+from src.model.build_model import build
 from src.trainer.EpochBasedTrainer import EpochBasedTrainer
 from src.trainer.IterBasedTrainer import IterBasedTrainer
 from src.trainer.optimizer import build_optimizer
 from src.trainer.utils import (
     CustomTrainerConfigError,
-    TrainConfig,
+    DataConfig,
     ModelConfig,
-    deepspeed_init_distributed,
-    init_distributed,
-    setup_logger,
-    seed_all,
+    TrainConfig,
     barrier,
-    get_fsdp_wrap_policy,
+    deepspeed_init_distributed,
     get_default_device,
+    get_fsdp_wrap_policy,
+    init_distributed,
+    seed_all,
+    setup_logger,
 )
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 logger = logging.getLogger("train")
 
@@ -29,46 +32,38 @@ logger = logging.getLogger("train")
 @dataclass
 class CustomModelConfig(ModelConfig):
     name: str = "gpt2"
+    max_seq_length: int = 2048
+    chunk_size: int = 2048
+    use_flash_attention_2: bool = True
+    low_rank_factor: int = 8
+
+
+@dataclass
+class CustomDataConfig(DataConfig):
+    cache_path: str = "~/pile_tinyllama"
 
 
 @dataclass
 class CustomTrainConfig(TrainConfig):
     model: CustomModelConfig = field(default_factory=CustomModelConfig)
+    data: CustomDataConfig = field(default_factory=CustomDataConfig)
 
 
 def main(config: TrainConfig):
-    logger.info(f"Creating dataloader")
-    """
-    *****************************************
-    *                                       *
-    *                                       *
-    * Building the dataloader               *
-    * dataloader = build_loader(config)     *
-    *                                       *
-    ***************************************
-    """
-    dataloader = None
-
     logger.info(f"Creating model")
-    """
-    *****************************************
-    *                                       *
-    *                                       *
-    * Building the model                    *
-    * model = build_model(config.model)     *
-    *                                       *
-    *****************************************
-    """
-    model = None
-    if hasattr(model, "num_params"):
-        logger.info(f"Model has {model.num_params()} parameters")
+    model, tokenizer = build(config.model)
 
-    if hasattr(model, "num_params"):
-        logger.info(f"Model has {model.num_params()} parameters")
+    logger.info(f"Creating dataloader")
+    dataloader = build_loader(
+        tokenizer,
+        batch_size=config.device_train_batch_size,
+        max_seq_length=config.model.max_seq_length,
+        data_config=config.data,
+    )
 
     if hasattr(model, "gradient_checkpointing_enable") and config.activation_checkpointing:
-        model.gradient_checkpointing_enable()
-        model.enalbe_input_requre_grads()
+        model.model.gradient_checkpointing_enable()
+        model.model.enalbe_input_requre_grads()
 
     if config.fsdp.enabled:
         if hasattr(model, "get_fsdp_wrap_policy"):
@@ -110,7 +105,7 @@ def main(config: TrainConfig):
         )
 
     elif config.deepspeed.enabled:
-        from deepspeed import deepspeed
+        import deepspeed
 
         if config.optimizer.name == "adamw":
             parameter = None
@@ -125,7 +120,7 @@ def main(config: TrainConfig):
                 filter_bias_and_bn=config.optimizer.decay_norm_and_bias,
             )
 
-        model, optimizer, _ = deepspeed.initialize(
+        model, optimizer, _, _ = deepspeed.initialize(
             model=model,
             config=config.deepspeed_init,
             optimizer=optimizer if optimizer is not None else None,
@@ -145,7 +140,7 @@ def main(config: TrainConfig):
         "optimizer": optimizer,
         "lr_scheduler": config.scheduler,
         "data_loader": dataloader,
-        "word_dir": config.save_folder,
+        "work_dir": config.save_folder,
         "max_num_checkpoints": config.checkpoint.save_num_checkpoints_to_keep,
         "log_period": config.console_log_interval,
         "ckpt_period": config.save_interval,
@@ -155,7 +150,7 @@ def main(config: TrainConfig):
         "cumulative_iters": config.gradient_accumulation_steps,
         "eval_data_loader": None,
         "is_distributed": config.is_distribute,
-        "deep_speed": config.deepspeed.enabled,
+        "deepspeed": config.deepspeed.enabled,
         "fsdp": config.fsdp.enabled,
         "torch_compile": config.compile,
         "dtype": config.autocast_precision,
@@ -177,9 +172,12 @@ def main(config: TrainConfig):
 
 if __name__ == "__main__":
     try:
-        config_path, other_args = sys.argv[1], sys.argv[2:]
+        if "--local_rank" in sys.argv[1]:
+            config_path, other_args = sys.argv[2], sys.argv[3:]
+        else:
+            config_path, other_args = sys.argv[1], sys.argv[2:]
     except IndexError:
-        raise CustomTrainerConfigError(f"Usage: {sys.argv[0]} CONFIG_PATH [OTHER_ARGS]")
+        raise CustomTrainerConfigError(f"Usage: [--local_rank] {sys.argv[0]} CONFIG_PATH [OTHER_ARGS]")
 
     config = CustomTrainConfig.load(config_path, other_args)
 
@@ -196,7 +194,7 @@ if __name__ == "__main__":
     if config.rank == 0:
         save_path = Path(config.save_folder) / "config.yaml"
         if save_path.is_file() and not config.save_overwrite:
-            raise CustomTrainerConfigError(f"{save_path} already exists, use --save_overwrite to overwrite")
+            raise CustomTrainerConfigError(f"{save_path} already exists, use save_overwrite=true to overwrite")
         else:
             logger.info(f"Saving config to {save_path}")
             save_path.parent.mkdir(exist_ok=True, parents=True)

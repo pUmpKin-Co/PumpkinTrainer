@@ -1,6 +1,6 @@
 run_name: metalora
 seed: 322
-run_strategy: epoch
+run_strategy: step
 run_duration: 1
 dry_run: false
 model:
@@ -105,3 +105,4 @@ gradient_accumulation_steps: 1
 max_grad_norm: 1.0
 precision: bf16
 accelerator_type: "gpu"
+

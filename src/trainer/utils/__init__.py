@@ -1,4 +1,4 @@
-from .config_parser import TrainConfig, ModelConfig
+from .config_parser import TrainConfig, ModelConfig, DataConfig
 from .distribute import *
 from .error_message import *
 from .logger import setup_logger
