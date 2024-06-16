@@ -7,10 +7,10 @@ import wandb
 from packaging import version
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from dataclasses import dataclass, field
-from Customtrainer.EpochBasedTrainer import EpochBasedTrainer
-from Customtrainer.IterBasedTrainer import IterBasedTrainer
-from Customtrainer.optimizer import build_optimizer
-from Customtrainer.utils import (
+from src.trainer.EpochBasedTrainer import EpochBasedTrainer
+from src.trainer.IterBasedTrainer import IterBasedTrainer
+from src.trainer.optimizer import build_optimizer
+from src.trainer.utils import (
     CustomTrainerConfigError,
     TrainConfig,
     ModelConfig,

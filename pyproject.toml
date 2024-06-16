@@ -29,10 +29,10 @@ dependencies = [
 [project.urls]
 
 [tool.setuptools.packages.find]
-exclude = ["Config*", "Script*", "assets*", "examples.*", ]
+exclude = ["config*", "Script*", "assets*", "examples.*", ]
 
 [tool.wheel]
-exclude = ["Config*", "Script*", "assets*", "examples.*", ]
+exclude = ["config*", "Script*", "assets*", "examples.*", ]
 
 license = { file = "LICENSE" }
 
