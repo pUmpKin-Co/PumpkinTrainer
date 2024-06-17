@@ -54,8 +54,13 @@ class EvalHook(HookBase):
             batch = self.trainer.put_input_to_device(batch)
             new_tokens = batch["new_tokens"]
             inputs = {k: batch[k] for k in ["input_ids", "attention_mask", "labels"]}
-            with torch.autocast(
-                device_type=self.trainer.autocast_type, enabled=self.trainer._enable_amp, dtype=self.trainer.dtype
+            with (
+                torch.autocast(
+                    device_type=self.trainer.autocast_type,
+                    enabled=self.trainer._enable_amp,
+                    dtype=self.trainer.dtype,
+                )
+                and torch.inference_mode()
             ):
                 outputs = self.trainer.model(**inputs, should_build=True)
             loss = outputs.loss

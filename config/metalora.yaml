@@ -75,7 +75,7 @@ evaluators:
   type: ["perplexity"]
   data:
     paths: /home/aiscuser/sflora_data/pg19/349.txt
-eval_interval: 1000
+eval_interval: 100
 
 # save
 save_folder: ./

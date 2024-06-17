@@ -85,8 +85,6 @@ def wrap_attention(
 
 
 def build(config):
-    attention, target_layer = get_by_name(config.name, config.use_flash_attention_2)
-
     if "llama" in config.name.lower():
         model_config = CustomLlamaForCausalLM.config_class.from_pretrained(config.name)
         model_config.low_rank_factor = config.low_rank_factor
@@ -103,6 +101,9 @@ def build(config):
     attn_config = {
         "config": model_config,
     }
+    attention, target_layer = get_by_name(config.name, config.use_flash_attention_2)
+    model = wrap_attention(model, attention, attn_config, target_layer)
+
     tokenizer = AutoTokenizer.from_pretrained(
         pretrained_model_name_or_path=config.name,
         truth_remote_code=True,

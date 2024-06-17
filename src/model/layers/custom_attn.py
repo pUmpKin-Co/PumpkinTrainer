@@ -14,7 +14,7 @@ from transformers.models.llama.modeling_llama import (
     repeat_kv,
 )
 
-from .layers_utils import DeltaRecurrentUpdate
+from .layers_utils import MambaSelectiveScan
 
 logger = LoggerFactory.create_logger(__name__)
 
@@ -22,13 +22,18 @@ logger = LoggerFactory.create_logger(__name__)
 class SSMLLamaFlashAttention2(LlamaFlashAttention2):
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
-        self.recurrence_module = DeltaRecurrentUpdate(config.low_rank_factor, config.hidden_size)
+        self.recurrence_module = MambaSelectiveScan(config.low_rank_factor, config.hidden_size)
 
         low_rank_factor = config.low_rank_factor
         key_value_dim = self.head_dim * self.num_key_value_heads
-        self.query_up_proj = nn.Linear(low_rank_factor * low_rank_factor, self.hidden_size, bias=False)
-        self.key_up_proj = nn.Linear(low_rank_factor * low_rank_factor, key_value_dim, bias=False)
-        self.value_up_proj = nn.Linear(low_rank_factor * low_rank_factor, key_value_dim, bias=False)
+        self.query_up_proj = nn.Linear(low_rank_factor, self.hidden_size, bias=False)
+        self.key_up_proj = nn.Linear(low_rank_factor, key_value_dim, bias=False)
+        self.value_up_proj = nn.Linear(low_rank_factor, key_value_dim, bias=False)
+
+        with torch.no_grad():
+            nn.init.zeros_(self.query_up_proj.weight)
+            nn.init.zeros_(self.key_up_proj.weight)
+            nn.init.zeros_(self.value_up_proj.weight)
 
         self.in_recurrence_cache = None
 

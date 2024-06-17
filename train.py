@@ -34,9 +34,9 @@ logger = logging.getLogger("train")
 class CustomModelConfig(ModelConfig):
     name: str = "gpt2"
     max_seq_length: int = 2048
-    chunk_size: int = 2048
+    chunk_size: int = 512
     use_flash_attention_2: bool = True
-    low_rank_factor: int = 8
+    low_rank_factor: int = 64
 
 
 @dataclass
