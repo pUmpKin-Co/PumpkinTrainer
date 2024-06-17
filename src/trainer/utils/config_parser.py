@@ -235,17 +235,14 @@ class DataConfig(BaseConfig):
 
 
 class EvaluatorType(StrEnum):
-    downstream = "downstream"
-    lm = "lm"
+    perplexity = "perplexity"
 
 
 @dataclass
 class EvaluatorConfig(BaseConfig):
-    label: str
-    type: EvaluatorType = EvaluatorType.lm
+    type: List[EvaluatorType] = field(default_factory=lambda: [EvaluatorType.perplexity])
     data: DataConfig = field(default_factory=DataConfig)
-    device_eval_batch_size: Optional[int] = None
-    subset_num_batches: Optional[int] = None
+    device_eval_batch_size: Optional[int] = 1
 
 
 @dataclass
@@ -549,7 +546,7 @@ class TrainConfig(BaseConfig):
     corresponded to the spike.
     """
 
-    evaluators: List[EvaluatorConfig] = field(default_factory=list)
+    evaluators: Optional[EvaluatorConfig] = None
     """
     Evaluation configurations.
     """
@@ -706,8 +703,8 @@ class TrainConfig(BaseConfig):
 
     @property
     def accelerator(self) -> str:
-        if self.accelerator_type == "cuda":
-            return "cuda"
+        if self.accelerator_type == "gpu":
+            return "gpu"
         elif self.accelerator_type == "cpu":
             return "cpu"
         elif self.accelerator_type == "mps":

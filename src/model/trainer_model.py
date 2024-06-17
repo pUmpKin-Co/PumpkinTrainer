@@ -38,18 +38,18 @@ class TrainerModel(nn.Module):
         self.model = model
 
     def clear_cache(self):
-        for name, module in self.named_modules():
+        for name, module in self.model.named_modules():
             if hasattr(module, "clear_cache"):
                 module.clear_cache()
 
     def set_no_grad(self):
-        for name, param in self.named_parameters():
+        for name, param in self.model.named_parameters():
             if "lora" in name:
                 param.requires_grad = True
             else:
                 param.requires_grad = False
 
-        for name, module in self.named_modules():
+        for name, module in self.model.named_modules():
             if any(
                 [
                     isinstance(module, cls)
@@ -76,7 +76,6 @@ class TrainerModel(nn.Module):
 
                 all_params += num_params
                 if param.requires_grad:
-                    print(name)
                     trainable_params += num_params
 
             if logger is not None:
@@ -84,57 +83,8 @@ class TrainerModel(nn.Module):
                     f"Trainable params: {trainable_params:,d}, All params: {all_params:,d}, trainable: {100 * trainable_params/all_params:.2f}"
                 )
 
-    def forward(self, batch):
-        input_ids = torch.tensor_split(
-            batch["input_ids"],
-            list(range(self.config.chunk_size, batch["input_ids"].shape[1], self.config.chunk_size)),
-            dim=1,
-        )
-        if "attention_mask" in batch:
-            attention_mask = torch.tensor_split(
-                batch["attention_mask"],
-                list(range(self.config.chunk_size, batch["attention_mask"].shape[1], self.config.chunk_size)),
-                dim=1,
-            )
-
-        if "labels" in batch:
-            labels = torch.tensor_split(
-                batch["labels"],
-                list(range(self.config.chunk_size, batch["labels"].shape[1], self.config.chunk_size)),
-                dim=1,
-            )
-
-        self.clear_cache()
-        past_statistic = defaultdict(list)
-        for i in range(len(input_ids) - 1):
-            outputs = self.model(
-                input_ids=input_ids[i],
-                attention_mask=attention_mask[i] if "attention_mask" in batch else None,
-                labels=labels[i] if "labels" in batch else None,
-                output_hidden_states=False,
-                use_cache=False,
-                output_attentions=False,
-                past_statistic=past_statistic,
-                should_build=True,
-            )
-
-            ntp_loss = outputs.loss
-
-            self.backward(ntp_loss)
-
-        last_outputs = self.model(
-            input_ids=input_ids[-1],
-            attention_mask=attention_mask[-1] if "attention_mask" in batch else None,
-            labels=labels[-1] if "labels" in batch else None,
-            output_hidden_states=False,
-            use_cache=False,
-            output_attentions=False,
-            past_statistic=past_statistic,
-            should_build=True,
-        )
-        ntp_loss = last_outputs.loss
-
-        return ntp_loss
+    def forward(self, **kwargs):
+        return self.model(**kwargs)
 
     def custom_save_checkpoint(self, **kwargs):
         state_dict = self.state_dict()

@@ -1,6 +1,6 @@
 import math
 import random
-from typing import List, Optional, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -13,16 +13,16 @@ from transformers.models.llama.modeling_llama import (
     apply_rotary_pos_emb,
     repeat_kv,
 )
+
 from .layers_utils import DeltaRecurrentUpdate
+
 logger = LoggerFactory.create_logger(__name__)
 
 
 class SSMLLamaFlashAttention2(LlamaFlashAttention2):
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
-        self.recurrence_module = DeltaRecurrentUpdate(
-            config.low_rank_factor, config.hidden_size
-        )
+        self.recurrence_module = DeltaRecurrentUpdate(config.low_rank_factor, config.hidden_size)
 
         low_rank_factor = config.low_rank_factor
         key_value_dim = self.head_dim * self.num_key_value_heads
@@ -82,9 +82,7 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
         if self.in_recurrence_cache is not None:
             self.in_recurrence_cache = self.in_recurrence_cache.detach()
 
-        in_recurrence_cache = self.recurrence_module(
-            hidden_states, self.in_recurrence_cache
-        )
+        in_recurrence_cache = self.recurrence_module(hidden_states, self.in_recurrence_cache)
         self.in_recurrence_cache = in_recurrence_cache
 
     def forward(
@@ -103,7 +101,8 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
 
         if (
             past_statistic is not None
-            and "attn" in past_statistic and len(past_statistic["attn"]) > self.layer_idx
+            and "attn" in past_statistic
+            and len(past_statistic["attn"]) > self.layer_idx
         ):
             past_input = past_statistic["attn"][self.layer_idx]
             past_input = past_input.detach()
@@ -112,7 +111,7 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
         query_states, key_states, value_states = self.compute_qkv(hidden_states)
 
         if not self.training and should_build:
-            self.update_memory(key_states, value_states)
+            self.update_input_recurrence(hidden_states)
 
         if past_statistic is not None:
             if len(past_statistic["attn"]) > self.layer_idx:
@@ -124,9 +123,7 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
         if past_key_value is not None:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin, position_ids
-        )
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}
@@ -173,5 +170,5 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
             attn_output,
             attn_weights,
             past_key_value,
-            (self.in_recurrence_cache, ),
+            (self.in_recurrence_cache,),
         )

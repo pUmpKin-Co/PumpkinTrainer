@@ -1,6 +1,13 @@
 import logging
+from typing import List
 
+import torch
+import wandb
+from tqdm import tqdm
+
+from ..utils import get_rank
 from .hookbase import HookBase
+from .logger_hook import LoggerHook
 
 logger = logging.getLogger("train")
 
@@ -11,7 +18,11 @@ class EvalHook(HookBase):
     It is executed every ``period`` epochs and after the last epoch.
     """
 
-    def __init__(self, period: int, task: str = "cls"):
+    func_mapping = {
+        "perplexity": "perplexity_eval_func",
+    }
+
+    def __init__(self, period: int, evaluators: List[str]):
         """
         Args:
             period (int): The period to run ``eval_func``. Set to 0 to
@@ -21,9 +32,46 @@ class EvalHook(HookBase):
         """
         super(EvalHook, self).__init__()
         self._period = period
+        self._eval_func_bank = []
+        for evals in evaluators:
+            assert evals in self.func_mapping, f"evaluators {evals} not be supported"
+            self._eval_func_bank.append(getattr(self, self.func_mapping[evals]))
 
     def _eval_func(self):
-        raise NotImplementedError("Please implement the _eval_func method")
+        for eval_func in self._eval_func_bank:
+            eval_func()
+
+        self.trainer.model.train()
+
+    def perplexity_eval_func(self):
+        self.trainer.model.eval()
+        self.trainer.model.clear_cache()
+        total_tokens = 0
+        total_ppl = 0
+        self.trainer.model.clear_cache()
+
+        for batch in tqdm(self.trainer.eval_data_loader, desc="Evaluating", disable=get_rank() != 0):
+            batch = self.trainer.put_input_to_device(batch)
+            new_tokens = batch["new_tokens"]
+            inputs = {k: batch[k] for k in ["input_ids", "attention_mask", "labels"]}
+            with torch.autocast(
+                device_type=self.trainer.autocast_type, enabled=self.trainer._enable_amp, dtype=self.trainer.dtype
+            ):
+                outputs = self.trainer.model(**inputs, should_build=True)
+            loss = outputs.loss
+            ppl = loss.exp().item()
+
+            total_ppl += ppl * new_tokens
+            total_tokens += new_tokens
+
+        ppl = total_ppl / total_tokens
+        logger.info(f"{self.trainer.cur_iter}: ppl: {ppl:.4f}")
+        for hook in self.trainer._hooks:
+            if isinstance(hook, LoggerHook):
+                hook._tb_writer.add_scalar("eval/ppl", ppl)
+                if hook.wandb:
+                    wandb.log({"eval/ppl": ppl})
+                break
 
 
 class EpochEvalHook(EvalHook):

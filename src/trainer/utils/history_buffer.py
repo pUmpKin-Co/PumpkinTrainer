@@ -1,5 +1,6 @@
-import numpy as np
 from collections import deque
+
+import numpy as np
 
 
 class HistoryBuffer:
@@ -14,6 +15,7 @@ class HistoryBuffer:
         >>> his_buf.avg
         0.15
     """
+
     def __init__(self, window_size: int = 20) -> None:
         self._history = deque(maxlen=window_size)
         self._count: int = 0

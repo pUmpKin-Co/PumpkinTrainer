@@ -1,12 +1,15 @@
 import logging
 from itertools import chain
 
+import torch
 from datasets import load_dataset, load_from_disk
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data.sampler import SequentialSampler
 from transformers import default_data_collator
 
 from ..trainer.utils.distribute import is_distributed
+from .data_utils import PG19Dataset, PG19SlowRawDataset
 
 logger = logging.getLogger("train")
 
@@ -87,3 +90,34 @@ def build_loader(
     )
 
     return train_loader
+
+
+def build_pg_loader(
+    tokenizer,
+    chunk_size: int = 2048,
+    file_path: str = None,
+):
+    with open(file_path, "r", encoding="utf-8") as f:
+        text = "".join(f.readlines()).strip()
+        input_ids = torch.tensor(data=[tokenizer.encode(text)], dtype=torch.int64)
+
+        _dataset: PG19SlowRawDataset = PG19SlowRawDataset(
+            fp=file_path,
+            tokenizer=tokenizer,
+            prefix_length=0,
+            stride_size=chunk_size,
+        )
+        _dataset.load_from_input_ids(input_ids=input_ids)
+        eval_dataset = PG19Dataset(dataset=_dataset)
+        eval_dataloader = DataLoader(
+            dataset=eval_dataset,
+            batch_size=1,
+            shuffle=False,
+            sampler=SequentialSampler(data_source=eval_dataset),
+            num_workers=0,
+            collate_fn=lambda i: i[0],
+            pin_memory=True,
+            drop_last=True,
+        )
+
+        return eval_dataloader

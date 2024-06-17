@@ -3,7 +3,8 @@ import os
 import os.path as osp
 import time
 import weakref
-from typing import Optional, Dict, List, Any, Tuple, Union
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -13,19 +14,32 @@ from torch.nn.parallel import DataParallel, DistributedDataParallel
 from torch.utils.data import DataLoader
 
 from .hook import (
+    DeepSpeedHook,
+    EpochCheckpointerHook,
+    Fp16OptimizerHook,
+    GradientCumulativeFp16OptimizerHook,
+    GradientCumulativeOptimizerHook,
     HookBase,
+    IterCheckpointerHook,
     LoggerHook,
     OptimizerHook,
-    Fp16OptimizerHook,
-    GradientCumulativeOptimizerHook,
-    GradientCumulativeFp16OptimizerHook,
-    DeepSpeedHook,
-    IterCheckpointerHook,
-    EpochCheckpointerHook,
 )
 from .hook.lr_scheduler_hook import *
-from .utils import symlink, is_main_process, get_world_size, gather, get_rank, MetricStroge
-from .utils.config_parser import SchedulerConfig, CompilerConfig, SchedulerType, SaveStrategy, SchedulerUnits
+from .utils import (
+    MetricStroge,
+    gather,
+    get_rank,
+    get_world_size,
+    is_main_process,
+    symlink,
+)
+from .utils.config_parser import (
+    CompilerConfig,
+    SaveStrategy,
+    SchedulerConfig,
+    SchedulerType,
+    SchedulerUnits,
+)
 
 logger = logging.getLogger("train")
 
@@ -354,6 +368,10 @@ class Trainer:
 
         # load metric_storage
         self.metric_storage = checkpoint["metric_storage"]
+        for key in self.metric_storage._history.keys():
+            sum_value = self.metric_storage._history[key]._sum
+            if isinstance(sum_value, torch.Tensor):
+                self.metric_storage._history[key]._sum = sum_value.detach().cpu().item()
 
         # load hooks
         hook_states = checkpoint.get("hooks", {})
@@ -436,7 +454,76 @@ class Trainer:
         #####################
         with torch.autocast(device_type=self.autocast_type, enabled=self._enable_amp, dtype=self.dtype):
             batch = self.put_input_to_device(batch)
-            self.loss_dict = self.model(batch)
+            input_ids = torch.tensor_split(
+                batch["input_ids"],
+                list(
+                    range(
+                        self.model.module.config.chunk_size,
+                        batch["input_ids"].shape[1],
+                        self.model.module.config.chunk_size,
+                    )
+                ),
+                dim=1,
+            )
+            if "attention_mask" in batch:
+                attention_mask = torch.tensor_split(
+                    batch["attention_mask"],
+                    list(
+                        range(
+                            self.model.module.config.chunk_size,
+                            batch["attention_mask"].shape[1],
+                            self.model.module.config.chunk_size,
+                        )
+                    ),
+                    dim=1,
+                )
+
+            if "labels" in batch:
+                labels = torch.tensor_split(
+                    batch["labels"],
+                    list(
+                        range(
+                            self.model.module.config.chunk_size,
+                            batch["labels"].shape[1],
+                            self.model.module.config.chunk_size,
+                        )
+                    ),
+                    dim=1,
+                )
+
+            self.model.clear_cache()
+            past_statistic = defaultdict(list)
+            for i in range(len(input_ids) - 1):
+                outputs = self.model(
+                    input_ids=input_ids[i],
+                    attention_mask=attention_mask[i] if "attention_mask" in batch else None,
+                    labels=labels[i] if "labels" in batch else None,
+                    output_hidden_states=False,
+                    use_cache=False,
+                    output_attentions=False,
+                    past_statistic=past_statistic,
+                    should_build=True,
+                )
+
+                ntp_loss = outputs.loss
+                if i == 0:
+                    continue
+
+                self.model.backward(ntp_loss)
+
+            last_outputs = self.model(
+                input_ids=input_ids[-1],
+                attention_mask=attention_mask[-1] if "attention_mask" in batch else None,
+                labels=labels[-1] if "labels" in batch else None,
+                output_hidden_states=False,
+                use_cache=False,
+                output_attentions=False,
+                past_statistic=past_statistic,
+                should_build=True,
+            )
+
+            ntp_loss = last_outputs.loss
+            self.loss_dict = ntp_loss
 
         if isinstance(self.loss_dict, torch.Tensor):
             self.loss_dict = {"total_loss": self.loss_dict}
@@ -466,7 +553,9 @@ class Trainer:
         if isinstance(modal_input, tuple):
             modal_input = tuple([item.to(device=self.device) for item in modal_input])
         elif isinstance(modal_input, Dict):
-            modal_input = {key: item.to(device=self.device) for key, item in modal_input.items()}
+            for key, item in modal_input.items():
+                if isinstance(item, torch.Tensor):
+                    modal_input[key] = item.to(device=self.device)
         else:
             modal_input = modal_input.to(self.device)
         return modal_input

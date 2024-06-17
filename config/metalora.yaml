@@ -1,6 +1,6 @@
 run_name: metalora
 seed: 322
-run_strategy: step
+run_strategy: epoch
 run_duration: 1
 dry_run: false
 model:
@@ -40,7 +40,7 @@ data:
   persistent_workers: false
   timeout: 0
 checkpoint:
-  save_interval: 10
+  save_interval: 1000
   save_interval_unsharded: null
   save_interval_ephemeral: null
   save_num_checkpoints_to_keep: 1
@@ -71,7 +71,10 @@ restore_dataloader: true
 fast_forward_batches: null
 
 # eval
-evaluators: []
+evaluators:
+  type: ["perplexity"]
+  data:
+    paths: /home/aiscuser/sflora_data/pg19/349.txt
 eval_interval: 1000
 
 # save

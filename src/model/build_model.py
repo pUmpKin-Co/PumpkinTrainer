@@ -1,10 +1,12 @@
 from functools import partial
 from typing import Any, Dict, Tuple
 
+import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
 
 from ..trainer import CustomTrainerConfigError
+from ..trainer.utils.distribute import get_rank
 from .hf_model.custom_llama import CustomLlamaForCausalLM
 from .layers.custom_attn import SSMLLamaFlashAttention2
 from .trainer_model import TrainerModel
@@ -89,14 +91,18 @@ def build(config):
         model_config = CustomLlamaForCausalLM.config_class.from_pretrained(config.name)
         model_config.low_rank_factor = config.low_rank_factor
         model_config._attn_implementation = "flash_attention_2"
-        model = CustomLlamaForCausalLM.from_pretrained(config.name, config=model_config)
+        model = CustomLlamaForCausalLM.from_pretrained(
+            config.name,
+            config=model_config,
+            torch_dtype=torch.bfloat16,
+            device_map=torch.device(get_rank()),
+        )
     else:
         raise CustomTrainerConfigError(f"Model {config.name} not supported")
 
     attn_config = {
         "config": model_config,
     }
-    model = wrap_attention(model, attention_config=attn_config, attention=attention, target_layer=target_layer)
     tokenizer = AutoTokenizer.from_pretrained(
         pretrained_model_name_or_path=config.name,
         truth_remote_code=True,

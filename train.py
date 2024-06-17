@@ -6,9 +6,10 @@ from pathlib import Path
 import torch
 import wandb
 from packaging import version
-from src.data.build_data import build_loader
+from src.data.build_data import build_loader, build_pg_loader
 from src.model.build_model import build
 from src.trainer.EpochBasedTrainer import EpochBasedTrainer
+from src.trainer.hook.eval_hook import EpochEvalHook, IterEvalHook
 from src.trainer.IterBasedTrainer import IterBasedTrainer
 from src.trainer.optimizer import build_optimizer
 from src.trainer.utils import (
@@ -59,6 +60,13 @@ def main(config: TrainConfig):
         batch_size=config.device_train_batch_size,
         max_seq_length=config.model.max_seq_length,
         data_config=config.data,
+    )
+
+    logger.info(f"Creating Evaluation dataloader")
+    eval_dataloader = build_pg_loader(
+        tokenizer,
+        chunk_size=config.model.chunk_size,
+        file_path=config.evaluators.data.paths,
     )
 
     if hasattr(model, "gradient_checkpointing_enable") and config.activation_checkpointing:
@@ -155,12 +163,19 @@ def main(config: TrainConfig):
         "torch_compile": config.compile,
         "dtype": config.autocast_precision,
         "save_ckpt_by": config.checkpoint.save_strategy,
+        "eval_data_loader": eval_dataloader,
     }
 
-    if config.run_strategy.step:
+    if config.run_strategy == "step":
         trainer = IterBasedTrainer(max_iters=config.run_duration, **share_args)
     else:
         trainer = EpochBasedTrainer(max_epochs=config.run_duration, **share_args)
+
+    if config.evaluators is not None:
+        if config.eval_interval > config.run_duration:
+            trainer.register_hook([IterEvalHook(evaluators=config.evaluators.type, period=config.eval_interval)])
+        else:
+            trainer.register_hook([EpochEvalHook(evaluators=config.evaluators.type, period=config.eval_interval)])
 
     if config.load_path is not None:
         resume_path = config.load_path
@@ -168,6 +183,10 @@ def main(config: TrainConfig):
         resume_path = None
 
     trainer.train(load_checkpoint=resume_path)
+
+    final_ckpt_dir = Path(trainer.ckpt_dir)
+    ckpt = model.custom_save_checkpoint()
+    torch.save(ckpt, final_ckpt_dir / "final_checkpoint.pt")
 
 
 if __name__ == "__main__":
