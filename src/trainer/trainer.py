@@ -505,13 +505,14 @@ class Trainer:
                     should_build=True,
                 )
 
-                ntp_loss = outputs.loss
                 if i == 0:
                     continue
 
+                ntp_loss = outputs.loss
                 self.model.backward(ntp_loss)
+                self.model.step()
 
-            last_outputs = self.model(
+            outputs = self.model(
                 input_ids=input_ids[-1],
                 attention_mask=attention_mask[-1] if "attention_mask" in batch else None,
                 labels=labels[-1] if "labels" in batch else None,
@@ -522,8 +523,8 @@ class Trainer:
                 should_build=True,
             )
 
-            ntp_loss = last_outputs.loss
-            self.loss_dict = ntp_loss
+            total_segment_loss = outputs.loss
+            self.loss_dict = {"total_loss": total_segment_loss}
 
         if isinstance(self.loss_dict, torch.Tensor):
             self.loss_dict = {"total_loss": self.loss_dict}
@@ -564,4 +565,5 @@ class Trainer:
         """
         True implementation of training process. Depends on the task, this function should be implemented in subclass.
         """
+        raise NotImplementedError
         raise NotImplementedError

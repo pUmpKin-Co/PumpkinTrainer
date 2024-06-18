@@ -62,7 +62,13 @@ class TrainerModel(nn.Module):
                     if any(
                         [
                             key in name
-                            for key in ["recurrence_module", "query_up_proj", "key_up_proj", "value_up_proj"]
+                            for key in [
+                                "recurrence_module",
+                                "query_up_proj",
+                                "key_up_proj",
+                                "value_up_proj",
+                                "gating_func",
+                            ]
                         ]
                     ):
                         param.requires_grad = True

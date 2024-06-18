@@ -59,9 +59,13 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
             key_weight = self.key_up_proj(self.in_recurrence_cache)
             value_weight = self.value_up_proj(self.in_recurrence_cache)
 
-            update_query = hidden_states @ query_weight
-            update_key = hidden_states @ key_weight
-            update_value = hidden_states @ value_weight
+            query_weight = torch.nn.functional.softmax(query_weight.mT, dim=-1)
+            key_weight = torch.nn.functional.softmax(key_weight.mT, dim=-1)
+            value_weight = torch.nn.functional.softmax(value_weight.mT, dim=-1)
+
+            update_query = hidden_states @ query_weight.mT
+            update_key = hidden_states @ key_weight.mT
+            update_value = hidden_states @ value_weight.mT
 
             query_states = query_states + update_query
             key_states = key_states + update_key

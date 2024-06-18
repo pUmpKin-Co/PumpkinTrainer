@@ -26,6 +26,7 @@ from transformers.models.llama.modeling_llama import (
 )
 
 from ..layers import SSMLLamaFlashAttention2
+from ..layers.layers_utils import DeltaRecurrentUpdate
 
 
 @dataclass
@@ -48,16 +49,12 @@ class CustomLlamaDecoderLayer(LlamaDecoderLayer):
         super().__init__(config, layer_idx)
         self.hidden_size = config.hidden_size
 
-        self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](
-            config=config, layer_idx=layer_idx
-        )
+        self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
         # self.mlp = CustomLlamaMLP(config)
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -77,18 +74,16 @@ class CustomLlamaDecoderLayer(LlamaDecoderLayer):
 
         # Self Attention
         if isinstance(self.self_attn, SSMLLamaFlashAttention2):
-            hidden_states, self_attn_weights, present_key_value, memory = (
-                self.self_attn(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_value,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    past_statistic=past_statistic,
-                    should_build=should_build,
-                    **kwargs,
-                )
+            hidden_states, self_attn_weights, present_key_value, memory = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                past_statistic=past_statistic,
+                should_build=should_build,
+                **kwargs,
             )
         else:
             hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -124,10 +119,7 @@ class CustomLlamaModel(LlamaModel):
     def __init__(self, config):
         super().__init__(config)
         self.layers = nn.ModuleList(
-            [
-                CustomLlamaDecoderLayer(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+            [CustomLlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
 
         self.post_init()
@@ -146,27 +138,17 @@ class CustomLlamaModel(LlamaModel):
         should_build: Optional[bool] = False,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CustomBaseModelOutputWithPast]:
-        output_attentions = (
-            output_attentions
-            if output_attentions is not None
-            else self.config.output_attentions
-        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else self.config.output_hidden_states
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time"
-            )
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
             batch_size, seq_length = input_ids.shape[:2]
         elif inputs_embeds is not None:
@@ -196,11 +178,7 @@ class CustomLlamaModel(LlamaModel):
 
         if self._use_flash_attention_2:
             # 2d mask is passed through the layers
-            attention_mask = (
-                attention_mask
-                if (attention_mask is not None and 0 in attention_mask)
-                else None
-            )
+            attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
         elif self._use_sdpa and not output_attentions:
             # output_attentions=True can not be supported when using SDPA, and we fall back on
             # the manual implementation that requires a 4D causal mask in all cases.
@@ -274,11 +252,7 @@ class CustomLlamaModel(LlamaModel):
 
         next_cache = None
         if use_cache:
-            next_cache = (
-                next_decoder_cache.to_legacy_cache()
-                if use_legacy_cache
-                else next_decoder_cache
-            )
+            next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
         if not return_dict:
             return tuple(
                 v
@@ -308,17 +282,27 @@ class CustomLlamaForCausalLM(LlamaForCausalLM):
     def _init_weights(self, module):
         std = self.config.initializer_range
         if isinstance(module, SSMLLamaFlashAttention2):
-            nn.init.zeros_(module.query_up_proj.weight)
-            nn.init.zeros_(module.key_up_proj.weight)
-            nn.init.zeros_(module.value_up_proj.weight)
+            # nn.init.zeros_(module.query_up_proj.weight)
+            # nn.init.zeros_(module.key_up_proj.weight)
+            # nn.init.zeros_(module.value_up_proj.weight)
+            nn.init.kaiming_uniform_(module.query_up_proj.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(module.key_up_proj.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(module.value_up_proj.weight, a=math.sqrt(5))
 
             module.query_up_proj.weight._no_init = True
             module.key_up_proj.weight._no_init = True
             module.value_up_proj.weight._no_init = True
 
+        if isinstance(module, DeltaRecurrentUpdate):
+            nn.init.kaiming_uniform_(module.key_proj.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(module.value_proj.weight, a=math.sqrt(5))
+            nn.init.zeros_(module.gating_func.weight)
+
+            module.key_proj.weight._no_init = True
+            module.value_proj.weight._no_init = True
+            module.gating_func.weight._no_init = True
+
         if isinstance(module, nn.Linear):
-            if not getattr(module, "_no_init", False):
-                module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
@@ -341,19 +325,11 @@ class CustomLlamaForCausalLM(LlamaForCausalLM):
         should_build: Optional[bool] = False,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CustomCausalLMOutputWithPast]:
-        output_attentions = (
-            output_attentions
-            if output_attentions is not None
-            else self.config.output_attentions
-        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
-            output_hidden_states
-            if output_hidden_states is not None
-            else self.config.output_hidden_states
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -372,13 +348,8 @@ class CustomLlamaForCausalLM(LlamaForCausalLM):
 
         hidden_states = outputs[0]
         if self.config.pretraining_tp > 1:
-            lm_head_slices = self.lm_head.weight.split(
-                self.vocab_size // self.config.pretraining_tp, dim=0
-            )
-            logits = [
-                F.linear(hidden_states, lm_head_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
+            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
+            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
             logits = torch.cat(logits, dim=-1)
         else:
             logits = self.lm_head(hidden_states)

@@ -46,19 +46,27 @@ class DeltaRecurrentUpdate(nn.Module):
     def __init__(self, low_rank_factor: int, hidden_size: int):
         super().__init__()
 
-        self.key_proj = nn.Linear(hidden_size, hidden_size)
-        self.value_proj = nn.Linear(hidden_size, low_rank_factor * low_rank_factor)
-        # self.out_norm = FusedRMSNorm(low_rank_factor * low_rank_factor)
+        self.key_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.value_proj = nn.Linear(hidden_size, low_rank_factor * low_rank_factor, bias=False)
+        self.gating_func = nn.Linear(hidden_size, low_rank_factor * low_rank_factor, bias=False)
+        # self.in_norm = FusedRMSNorm(hidden_size)
 
     def forward(self, hidden_states: torch.Tensor, prev_cache: torch.Tensor):
+        # hidden_states = self.in_norm(hidden_states)
         key_states = self.key_proj(hidden_states)  # B x L x H
+        key_states = torch.nn.functional.silu(key_states)
         value_states = self.value_proj(hidden_states)  # B x L x H
 
         if prev_cache is not None:
-            value_states = value_states - torch.einsum("b l h, b h d -> b l d", key_states, prev_cache)
+            gating = self.gating_func(hidden_states)
+            gating = torch.sigmoid(gating)
+            value_states = gating * value_states - (1 - gating) * torch.einsum(
+                "b l h, b h d -> b l d", key_states, prev_cache
+            )
             new_cache = prev_cache + torch.einsum("b l h, b l d -> b h d", key_states, value_states)
         else:
             new_cache = torch.einsum("b l h, b l d -> b h d", key_states, value_states)
 
-        new_cache = torch.nn.functional.normalize(new_cache, p=2, dim=-1)
+        # new_cache = torch.nn.functional.normalize(new_cache, p=2, dim=-1)
+        # new_cache = self.output_norm(new_cache)
         return new_cache

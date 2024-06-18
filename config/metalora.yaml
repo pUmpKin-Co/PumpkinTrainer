@@ -6,7 +6,7 @@ dry_run: false
 model:
   name: TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T
   max_seq_length: 2048
-  chunk_size: 512
+  chunk_size: 1024
 optimizer:
   name: adamw
   learning_rate: 0.0002
@@ -19,7 +19,7 @@ optimizer:
   metrics_log_interval: null
 deepspeed:
   enabled: true
-  stage: 2
+  stage: 0
   offload_optimizer: false
   offload_param: false
 scheduler:
@@ -75,7 +75,7 @@ evaluators:
   type: ["perplexity"]
   data:
     paths: /home/aiscuser/sflora_data/pg19/349.txt
-eval_interval: 1000
+eval_interval: 100
 
 # save
 save_folder: ./
@@ -89,8 +89,8 @@ reset_trainer_state: false
 sharded_checkpointer: torch_legacy
 
 # batch
-device_train_batch_size: 2
-device_eval_batch_size: 2
+device_train_batch_size: 8
+device_eval_batch_size: 8
 
 console_log_interval: 1
 compile: null
