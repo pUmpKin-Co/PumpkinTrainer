@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from deepspeed.utils.logging import LoggerFactory
+from einops import rearrange
 from transformers.cache_utils import Cache
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 from transformers.models.llama.modeling_llama import (
@@ -26,6 +27,7 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
 
         low_rank_factor = config.low_rank_factor
         key_value_dim = self.head_dim * self.num_key_value_heads
+        self.chunk_size = config.chunk_size
         self.query_up_proj = nn.Linear(low_rank_factor * low_rank_factor, self.hidden_size, bias=False)
         self.key_up_proj = nn.Linear(low_rank_factor * low_rank_factor, key_value_dim, bias=False)
         self.value_up_proj = nn.Linear(low_rank_factor * low_rank_factor, key_value_dim, bias=False)
@@ -55,21 +57,57 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
         value_states = self.v_proj(hidden_states)
 
         if self.in_recurrence_cache is not None:
-            query_weight = self.query_up_proj(self.in_recurrence_cache)
-            key_weight = self.key_up_proj(self.in_recurrence_cache)
-            value_weight = self.value_up_proj(self.in_recurrence_cache)
+            if isinstance(self.in_recurrence_cache, list) and self.training:
+                caches = torch.stack(self.in_recurrence_cache, dim=1)  # B x C x D x H   H, D
+                query_weight = torch.einsum("b c d h, q h -> b c d q", caches, self.query_up_proj.weight)
+                key_weight = torch.einsum("b c d h, k h -> b c d k", caches, self.key_up_proj.weight)
+                value_weight = torch.einsum("b c d h, v h -> b c d v", caches, self.value_up_proj.weight)
 
-            query_weight = torch.nn.functional.softmax(query_weight.mT, dim=-1)
-            key_weight = torch.nn.functional.softmax(key_weight.mT, dim=-1)
-            value_weight = torch.nn.functional.softmax(value_weight.mT, dim=-1)
+                query_weight = torch.nn.functional.softmax(query_weight.mT, dim=-1)
+                key_weight = torch.nn.functional.softmax(key_weight.mT, dim=-1)
+                value_weight = torch.nn.functional.softmax(value_weight.mT, dim=-1)
 
-            update_query = hidden_states @ query_weight.mT
-            update_key = hidden_states @ key_weight.mT
-            update_value = hidden_states @ value_weight.mT
+                hidden_states, query_state, key_state, value_state = map(
+                    lambda x: rearrange(x, "b (l c) d -> b l c d", c=self.chunk_size),
+                    (hidden_states, query_states, key_states, value_states),
+                )
 
-            query_states = query_states + update_query
-            key_states = key_states + update_key
-            value_states = value_states + update_value
+                org_first_query_state = query_state[:, 0]
+                org_first_key_state = key_state[:, 0]
+                org_first_value_state = value_state[:, 0]
+
+                update_query = hidden_states[:, 1:] @ query_weight.mT
+                update_key = hidden_states[:, 1:] @ key_weight.mT
+                update_value = hidden_states[:, 1:] @ value_weight.mT
+
+                update_query_states = query_state[:, 1:] + update_query
+                update_key_states = key_state[:, 1:] + update_key
+                update_value_states = value_state[:, 1:] + update_value
+
+                query_states = torch.cat([org_first_query_state.unsqueeze(1), update_query_states], dim=1)
+                key_states = torch.cat([org_first_key_state.unsqueeze(1), update_key_states], dim=1)
+                value_states = torch.cat([org_first_value_state.unsqueeze(1), update_value_states], dim=1)
+
+                query_states, key_states, value_states = map(
+                    lambda x: rearrange(x, "b l c d -> b (c l) d", c=self.chunk_size),
+                    (query_states, key_states, value_states),
+                )
+            else:
+                query_weight = self.query_up_proj(self.in_recurrence_cache)
+                key_weight = self.key_up_proj(self.in_recurrence_cache)
+                value_weight = self.value_up_proj(self.in_recurrence_cache)
+
+                query_weight = torch.nn.functional.softmax(query_weight.mT, dim=-1)
+                key_weight = torch.nn.functional.softmax(key_weight.mT, dim=-1)
+                value_weight = torch.nn.functional.softmax(value_weight.mT, dim=-1)
+
+                update_query = hidden_states @ query_weight.mT
+                update_key = hidden_states @ key_weight.mT
+                update_value = hidden_states @ value_weight.mT
+
+                query_states = query_states + update_query
+                key_states = key_states + update_key
+                value_states = value_states + update_value
 
         query_states = self.convert_3d_to_4d(query_states)
         key_states = self.convert_3d_to_4d(key_states)
@@ -83,10 +121,21 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
         return output
 
     def update_input_recurrence(self, hidden_states):
-        if self.in_recurrence_cache is not None:
-            self.in_recurrence_cache = self.in_recurrence_cache.detach()
-
-        in_recurrence_cache = self.recurrence_module(hidden_states, self.in_recurrence_cache)
+        # if self.in_recurrence_cache is not None:
+        # self.in_recurrence_cache = self.in_recurrence_cache.detach()
+        if self.training and hidden_states.shape[1] > self.chunk_size:
+            in_recurrence_cache = []
+            num_chunk = hidden_states.shape[1] // self.chunk_size
+            # we don't need the last chunk
+            if hidden_states.shape[1] % self.chunk_size == 0:
+                num_chunk -= 1
+            for i in range(num_chunk):
+                chunk = hidden_states[:, i * self.chunk_size : (i + 1) * self.chunk_size]
+                current_cache = self.recurrence_module(chunk, self.in_recurrence_cache)
+                in_recurrence_cache.append(current_cache)
+                self.in_recurrence_cache = current_cache.detach()
+        else:
+            in_recurrence_cache = self.recurrence_module(hidden_states, self.in_recurrence_cache)
         self.in_recurrence_cache = in_recurrence_cache
 
     def forward(
@@ -111,6 +160,8 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
             past_input = past_statistic["attn"][self.layer_idx]
             past_input = past_input.detach()
             self.update_input_recurrence(past_input)
+        elif self.training and should_build:
+            self.update_input_recurrence(hidden_states)
 
         query_states, key_states, value_states = self.compute_qkv(hidden_states)
 

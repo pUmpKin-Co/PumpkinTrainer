@@ -85,11 +85,10 @@ def wrap_attention(
 
 
 def build(config):
-    attention, target_layer = get_by_name(config.name, config.use_flash_attention_2)
-
     if "llama" in config.name.lower():
         model_config = CustomLlamaForCausalLM.config_class.from_pretrained(config.name)
         model_config.low_rank_factor = config.low_rank_factor
+        model_config.chunk_size = config.chunk_size
         model_config._attn_implementation = "flash_attention_2"
         model = CustomLlamaForCausalLM.from_pretrained(
             config.name,
@@ -100,9 +99,6 @@ def build(config):
     else:
         raise CustomTrainerConfigError(f"Model {config.name} not supported")
 
-    attn_config = {
-        "config": model_config,
-    }
     tokenizer = AutoTokenizer.from_pretrained(
         pretrained_model_name_or_path=config.name,
         truth_remote_code=True,

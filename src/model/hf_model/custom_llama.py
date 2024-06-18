@@ -278,6 +278,7 @@ class CustomLlamaForCausalLM(LlamaForCausalLM):
     def __init__(self, config):
         super().__init__(config)
         self.model = CustomLlamaModel(config)
+        self.chunk_size = config.chunk_size
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -357,6 +358,8 @@ class CustomLlamaForCausalLM(LlamaForCausalLM):
 
         loss = None
         if labels is not None:
+            logits = logits[:, self.chunk_size :]
+            labels = labels[:, self.chunk_size :]
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()

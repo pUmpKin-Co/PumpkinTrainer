@@ -68,6 +68,8 @@ class TrainerModel(nn.Module):
                                 "key_up_proj",
                                 "value_up_proj",
                                 "gating_func",
+                                "key_proj",
+                                "value_proj",
                             ]
                         ]
                     ):
@@ -82,6 +84,7 @@ class TrainerModel(nn.Module):
 
                 all_params += num_params
                 if param.requires_grad:
+                    print(name)
                     trainable_params += num_params
 
             if logger is not None:

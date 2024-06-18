@@ -454,72 +454,14 @@ class Trainer:
         #####################
         with torch.autocast(device_type=self.autocast_type, enabled=self._enable_amp, dtype=self.dtype):
             batch = self.put_input_to_device(batch)
-            input_ids = torch.tensor_split(
-                batch["input_ids"],
-                list(
-                    range(
-                        self.model.module.config.chunk_size,
-                        batch["input_ids"].shape[1],
-                        self.model.module.config.chunk_size,
-                    )
-                ),
-                dim=1,
-            )
-            if "attention_mask" in batch:
-                attention_mask = torch.tensor_split(
-                    batch["attention_mask"],
-                    list(
-                        range(
-                            self.model.module.config.chunk_size,
-                            batch["attention_mask"].shape[1],
-                            self.model.module.config.chunk_size,
-                        )
-                    ),
-                    dim=1,
-                )
-
-            if "labels" in batch:
-                labels = torch.tensor_split(
-                    batch["labels"],
-                    list(
-                        range(
-                            self.model.module.config.chunk_size,
-                            batch["labels"].shape[1],
-                            self.model.module.config.chunk_size,
-                        )
-                    ),
-                    dim=1,
-                )
-
             self.model.clear_cache()
-            past_statistic = defaultdict(list)
-            for i in range(len(input_ids) - 1):
-                outputs = self.model(
-                    input_ids=input_ids[i],
-                    attention_mask=attention_mask[i] if "attention_mask" in batch else None,
-                    labels=labels[i] if "labels" in batch else None,
-                    output_hidden_states=False,
-                    use_cache=False,
-                    output_attentions=False,
-                    past_statistic=past_statistic,
-                    should_build=True,
-                )
-
-                if i == 0:
-                    continue
-
-                ntp_loss = outputs.loss
-                self.model.backward(ntp_loss)
-                self.model.step()
-
             outputs = self.model(
-                input_ids=input_ids[-1],
-                attention_mask=attention_mask[-1] if "attention_mask" in batch else None,
-                labels=labels[-1] if "labels" in batch else None,
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["labels"],
                 output_hidden_states=False,
                 use_cache=False,
                 output_attentions=False,
-                past_statistic=past_statistic,
                 should_build=True,
             )
 
