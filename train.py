@@ -36,7 +36,7 @@ class CustomModelConfig(ModelConfig):
     max_seq_length: int = 2048
     chunk_size: int = 2048
     use_flash_attention_2: bool = True
-    low_rank_factor: int = 8
+    low_rank_factor: int = 16
 
 
 @dataclass

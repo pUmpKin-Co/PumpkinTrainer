@@ -4,7 +4,7 @@ from collections import defaultdict
 import torch
 import torch.nn as nn
 
-from .layers import SSMLLamaFlashAttention2
+from .layers import CustomLlamaMLP, SSMLLamaFlashAttention2
 
 logger = logging.getLogger("train")
 
@@ -55,6 +55,7 @@ class TrainerModel(nn.Module):
                     isinstance(module, cls)
                     for cls in [
                         SSMLLamaFlashAttention2,
+                        CustomLlamaMLP,
                     ]
                 ]
             ):
@@ -67,9 +68,10 @@ class TrainerModel(nn.Module):
                                 "query_up_proj",
                                 "key_up_proj",
                                 "value_up_proj",
-                                "gating_func",
-                                "key_proj",
-                                "value_proj",
+                                "in_recurrent_module",
+                                "out_recurrent_module",
+                                "ffn_up_proj",
+                                "ffn_down_proj",
                             ]
                         ]
                     ):
@@ -87,10 +89,10 @@ class TrainerModel(nn.Module):
                     print(name)
                     trainable_params += num_params
 
-            if logger is not None:
-                logger.info(
-                    f"Trainable params: {trainable_params:,d}, All params: {all_params:,d}, trainable: {100 * trainable_params/all_params:.2f}"
-                )
+        if logger is not None:
+            logger.info(
+                f"Trainable params: {trainable_params:,d}, All params: {all_params:,d}, trainable: {100 * trainable_params/all_params:.2f}"
+            )
 
     def forward(self, **kwargs):
         return self.model(**kwargs)

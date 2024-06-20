@@ -63,6 +63,56 @@ def get_pile(
     return lm_datasets
 
 
+def get_redpajama(
+    tokenizer,
+    block_size: int = 2048,
+    cache_path: str = "~/RedPajama_Cache",
+):
+    try:
+        lm_datasets = load_from_disk(cache_path)
+    except Exception:
+        raw_datasets = load_dataset("togethercomputer/RedPajama-Data-1T-Sample")
+        raw_datasets = raw_datasets.filter(lambda x: len(x["text"]) > 2048)
+        train_datasets = raw_datasets["train"]
+        column_names = train_datasets.column_names
+        text_column_name = "text" if "text" in column_names else column_names[0]
+
+        def tokenize_function(examples):
+            return tokenizer(examples[text_column_name])
+
+        tokenized_datasets = train_datasets.map(
+            tokenize_function,
+            batched=True,
+            num_proc=8,
+            remove_columns=column_names,
+            desc="Running tokenizer on dataset",
+        )
+
+        block_size = min(block_size, tokenizer.model_max_length)
+
+        def group_texts(examples):
+            concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+            total_length = len(concatenated_examples[list(examples.keys())[0]])
+            total_length = (total_length // block_size) * block_size
+            result = {
+                k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
+                for k, t in concatenated_examples.items()
+            }
+            result["labels"] = result["input_ids"].copy()
+            return result
+
+        lm_datasets = tokenized_datasets.map(
+            group_texts,
+            batched=True,
+            num_proc=8,
+            desc=f"Grouping texts in chunks of {block_size}",
+        )
+
+        lm_datasets.save_to_disk(cache_path)
+
+    return lm_datasets
+
+
 def build_loader(
     tokenizer,
     max_seq_length: int = 2048,
@@ -71,6 +121,8 @@ def build_loader(
 ):
     if data_config.paths == "pile":
         dataset = get_pile(tokenizer, max_seq_length, data_config.cache_path)
+    elif data_config.paths == "redpajama":
+        dataset = get_redpajama(tokenizer, max_seq_length, data_config.cache_path)
 
     if is_distributed():
         logger.info(f"Train data loaded with {len(dataset)} samples")
@@ -99,7 +151,7 @@ def build_pg_loader(
 ):
     with open(file_path, "r", encoding="utf-8") as f:
         text = "".join(f.readlines()).strip()
-        input_ids = torch.tensor(data=[tokenizer.encode(text)], dtype=torch.int64)
+        input_ids = torch.tensor(data=[tokenizer.encode(text)], dtype=torch.int64)[:, :2048]
 
         _dataset: PG19SlowRawDataset = PG19SlowRawDataset(
             fp=file_path,

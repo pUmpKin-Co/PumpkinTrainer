@@ -124,16 +124,17 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
         # if self.in_recurrence_cache is not None:
         # self.in_recurrence_cache = self.in_recurrence_cache.detach()
         if self.training and hidden_states.shape[1] > self.chunk_size:
-            in_recurrence_cache = []
-            num_chunk = hidden_states.shape[1] // self.chunk_size
-            # we don't need the last chunk
-            if hidden_states.shape[1] % self.chunk_size == 0:
-                num_chunk -= 1
-            for i in range(num_chunk):
-                chunk = hidden_states[:, i * self.chunk_size : (i + 1) * self.chunk_size]
-                current_cache = self.recurrence_module(chunk, self.in_recurrence_cache)
-                in_recurrence_cache.append(current_cache)
-                self.in_recurrence_cache = current_cache.detach()
+            pass
+            # in_recurrence_cache = []
+            # num_chunk = hidden_states.shape[1] // self.chunk_size
+            # # we don't need the last chunk
+            # if hidden_states.shape[1] % self.chunk_size == 0:
+            #     num_chunk -= 1
+            # for i in range(num_chunk):
+            #     chunk = hidden_states[:, i * self.chunk_size : (i + 1) * self.chunk_size]
+            #     current_cache = self.recurrence_module(chunk, self.in_recurrence_cache)
+            #     in_recurrence_cache.append(current_cache)
+            #     self.in_recurrence_cache = current_cache.detach()
         else:
             in_recurrence_cache = self.recurrence_module(hidden_states, self.in_recurrence_cache)
         self.in_recurrence_cache = in_recurrence_cache
@@ -160,8 +161,8 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
             past_input = past_statistic["attn"][self.layer_idx]
             past_input = past_input.detach()
             self.update_input_recurrence(past_input)
-        elif self.training and should_build:
-            self.update_input_recurrence(hidden_states)
+        # elif self.training and should_build:
+        # self.update_input_recurrence(hidden_states)
 
         query_states, key_states, value_states = self.compute_qkv(hidden_states)
 

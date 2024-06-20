@@ -4,9 +4,9 @@ from .hookbase import HookBase
 class DeepSpeedHook(HookBase):
     def after_iter(self) -> None:
         self.trainer.model.backward(self.trainer.loss_dict["total_loss"])
-        for name, param in self.trainer.model.named_parameters():
-            if param.grad is not None:
-                print(name, param.grad.norm().item())
+        # for name, param in self.trainer.model.named_parameters():
+        # if param.grad is not None:
+        # print(name, param.grad.norm().item())
         self.trainer._call_hooks("after_backward")
         self.trainer.model.step()
         self.trainer._call_hooks("after_step")

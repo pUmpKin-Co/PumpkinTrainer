@@ -25,7 +25,7 @@ from transformers.models.llama.modeling_llama import (
     LlamaRMSNorm,
 )
 
-from ..layers import SSMLLamaFlashAttention2
+from ..layers import CustomLlamaMLP, SSMLLamaFlashAttention2
 from ..layers.layers_utils import DeltaRecurrentUpdate
 
 
@@ -51,7 +51,7 @@ class CustomLlamaDecoderLayer(LlamaDecoderLayer):
 
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
-        # self.mlp = CustomLlamaMLP(config)
+        # self.mlp = CustomLlamaMLP(config, layer_idx)
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -100,8 +100,14 @@ class CustomLlamaDecoderLayer(LlamaDecoderLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        # hidden_states = self.mlp(hidden_states, memory=memory)
-        hidden_states = self.mlp(hidden_states)
+        if isinstance(self.mlp, CustomLlamaMLP):
+            hidden_states = self.mlp(
+                hidden_states,
+                past_statistic=past_statistic,
+                should_build=should_build,
+            )
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -283,16 +289,23 @@ class CustomLlamaForCausalLM(LlamaForCausalLM):
     def _init_weights(self, module):
         std = self.config.initializer_range
         if isinstance(module, SSMLLamaFlashAttention2):
-            # nn.init.zeros_(module.query_up_proj.weight)
-            # nn.init.zeros_(module.key_up_proj.weight)
-            # nn.init.zeros_(module.value_up_proj.weight)
-            nn.init.kaiming_uniform_(module.query_up_proj.weight, a=math.sqrt(5))
-            nn.init.kaiming_uniform_(module.key_up_proj.weight, a=math.sqrt(5))
-            nn.init.kaiming_uniform_(module.value_up_proj.weight, a=math.sqrt(5))
+            nn.init.zeros_(module.query_up_proj.weight)
+            nn.init.zeros_(module.key_up_proj.weight)
+            nn.init.zeros_(module.value_up_proj.weight)
+            # nn.init.kaiming_uniform_(module.query_up_proj.weight, a=math.sqrt(5))
+            # nn.init.kaiming_uniform_(module.key_up_proj.weight, a=math.sqrt(5))
+            # nn.init.kaiming_uniform_(module.value_up_proj.weight, a=math.sqrt(5))
 
             module.query_up_proj.weight._no_init = True
             module.key_up_proj.weight._no_init = True
             module.value_up_proj.weight._no_init = True
+
+        if isinstance(module, CustomLlamaMLP):
+            nn.init.zeros_(module.ffn_up_proj.weight)
+            nn.init.zeros_(module.ffn_down_proj.weight)
+
+            module.ffn_up_proj.weight._no_init = True
+            module.ffn_down_proj.weight._no_init = True
 
         if isinstance(module, DeltaRecurrentUpdate):
             nn.init.kaiming_uniform_(module.key_proj.weight, a=math.sqrt(5))
@@ -358,8 +371,6 @@ class CustomLlamaForCausalLM(LlamaForCausalLM):
 
         loss = None
         if labels is not None:
-            logits = logits[:, self.chunk_size :]
-            labels = labels[:, self.chunk_size :]
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
