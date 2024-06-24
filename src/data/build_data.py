@@ -71,7 +71,7 @@ def get_redpajama(
     try:
         lm_datasets = load_from_disk(cache_path)
     except Exception:
-        raw_datasets = load_dataset("togethercomputer/RedPajama-Data-1T-Sample")
+        raw_datasets = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", trust_remote_code=True)
         raw_datasets = raw_datasets.filter(lambda x: len(x["text"]) > 2048)
         train_datasets = raw_datasets["train"]
         column_names = train_datasets.column_names

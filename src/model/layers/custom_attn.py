@@ -15,7 +15,7 @@ from transformers.models.llama.modeling_llama import (
     repeat_kv,
 )
 
-from .layers_utils import DeltaRecurrentUpdate
+from .layers_utils import DeltaRecurrentUpdate, FusedRMSNorm
 
 logger = LoggerFactory.create_logger(__name__)
 
@@ -28,9 +28,13 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
         low_rank_factor = config.low_rank_factor
         key_value_dim = self.head_dim * self.num_key_value_heads
         self.chunk_size = config.chunk_size
-        self.query_up_proj = nn.Linear(low_rank_factor * low_rank_factor, self.hidden_size, bias=False)
-        self.key_up_proj = nn.Linear(low_rank_factor * low_rank_factor, key_value_dim, bias=False)
-        self.value_up_proj = nn.Linear(low_rank_factor * low_rank_factor, key_value_dim, bias=False)
+        self.query_up_proj = nn.Linear(low_rank_factor, self.hidden_size, bias=False)
+        self.key_up_proj = nn.Linear(low_rank_factor, key_value_dim, bias=False)
+        self.value_up_proj = nn.Linear(low_rank_factor, key_value_dim, bias=False)
+
+        # self.query_norm = FusedRMSNorm(self.hidden_size)
+        # self.key_norm = FusedRMSNorm(self.hidden_size)
+        # self.value_norm = FusedRMSNorm(self.hidden_size)
 
         self.in_recurrence_cache = None
 
@@ -66,6 +70,9 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
                 query_weight = torch.nn.functional.softmax(query_weight.mT, dim=-1)
                 key_weight = torch.nn.functional.softmax(key_weight.mT, dim=-1)
                 value_weight = torch.nn.functional.softmax(value_weight.mT, dim=-1)
+                # query_weight = self.query_norm(query_weight.mT)
+                # key_weight = self.key_norm(key_weight.mT)
+                # value_weight = self.value_norm(value_weight.mT)
 
                 hidden_states, query_state, key_state, value_state = map(
                     lambda x: rearrange(x, "b (l c) d -> b l c d", c=self.chunk_size),
@@ -100,6 +107,9 @@ class SSMLLamaFlashAttention2(LlamaFlashAttention2):
                 query_weight = torch.nn.functional.softmax(query_weight.mT, dim=-1)
                 key_weight = torch.nn.functional.softmax(key_weight.mT, dim=-1)
                 value_weight = torch.nn.functional.softmax(value_weight.mT, dim=-1)
+                # query_weight = self.query_norm(query_weight.mT)
+                # key_weight = self.key_norm(key_weight.mT)
+                # value_weight = self.value_norm(value_weight.mT)
 
                 update_query = hidden_states @ query_weight.mT
                 update_key = hidden_states @ key_weight.mT

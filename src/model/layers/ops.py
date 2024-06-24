@@ -1,13 +1,11 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2023, Yu Zhang, Songlin Yang
+# Mostly Borrowed Yu Zhang, Songlin Yang
 
 import functools
+from typing import Tuple
 
 import torch
 import triton
 import triton.language as tl
-from einops import rearrange
-from torch.cuda.amp import custom_bwd, custom_fwd
 
 
 def contiguous(fn):
@@ -22,467 +20,334 @@ def contiguous(fn):
     return wrapper
 
 
-# Inspired by "THE WY REPRESENTATION FOR PRODUCTS OF HOUSEHOLDER MATRICES" https://epubs.siam.org/doi/pdf/10.1137/0908009
-# o: cumprod
-# o2: cumprodsum
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
-    ],
-    key=["BT", "BK", "BV"],
-)
 @triton.jit
-def fwd_prepare_wy_repr_kernel(
-    k,
-    v,
-    beta,
-    w,
-    u,
-    A,
-    s_qk_h,
-    s_qk_t,
-    s_qk_d,
-    s_vo_h,
-    s_vo_t,
-    s_vo_d,
-    T,
-    K,
-    V,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
+def fused_recurrent_fwd_kernel(
+    # B: batch_size, T: seq_len, D: d
+    k,  # key [B, L, D_K]
+    v,  # value [B, L, D_V].
+    beta,  # beta [B, L]
+    h,  # output [B, L, D_K, D_V]
+    initial_state,
+    s_k_b,  # stride size: L * D_K
+    s_k_t,  # stride size: D_K
+    s_k_d,  # stride size: 1
+    s_v_b,  # stride size: L * D_V
+    s_v_t,  # stride size: D_V
+    s_v_d,  # stride size: 1
+    s_h_b,  # stride size: L * D_K * D_V
+    s_h_t,  # stride size: D_K * D_V
+    s_h_dk,  # stride size: D_V
+    s_h_dv,  # stride size: 1
+    s_beta,  # stride size: L
+    B,  # batch size
+    T,  # seq_len
+    BK: tl.constexpr,  # BLOCK SIZE along the K dimension
+    DK: tl.constexpr,  # D_head_K
+    DV: tl.constexpr,  # D_head_V
+    USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
 
-    b_A = tl.zeros([BT, BT], dtype=tl.float32)
-    p_beta = tl.make_block_ptr(beta + i_bh * T, (T,), (1,), (i_t * BT,), (BT,), (0,))
-    b_beta = tl.load(p_beta, boundary_check=(0,))
+    # indices
+    i_k, i_b = tl.program_id(0), tl.program_id(1)
 
-    for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+    p_k = k + i_b * s_k_b + i_k * BK + tl.arange(0, BK)
+    p_v = v + i_b * s_v_b + tl.arange(0, DV)
+    p_beta = beta + i_b * s_beta
+
+    p_h = h + i_b * s_h_b + (i_k * BK + tl.arange(0, BK)[:, None]) * DV + (tl.arange(0, DV)[None, :])
+
+    mask_bk = (i_k * BK + tl.arange(0, BK)) < DK
+    mask_bv = (tl.arange(0, DV)) < DV
+    mask_kv = mask_bk[:, None] & mask_bv[None, :]
+
+    h = tl.zeros([BK, DV], dtype=tl.float32)
+
+    if USE_INITIAL_STATE:
+        p_init_s = (
+            initial_state + i_b * s_h_t + (i_k * BK + tl.arange(0, BK)[:, None]) * DV + (tl.arange(0, DV)[None, :])
         )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_kb = (b_k * b_beta[:, None]).to(b_k.dtype)
-        b_A += tl.dot(b_kb, tl.trans(b_k), allow_tf32=False)
+        h += tl.load(p_init_s, mask=mask_kv, other=0).to(tl.float32)
 
-    b_A = -tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], b_A, 0)
+    for _ in range(0, T):
+        _k = tl.load(p_k, mask=mask_bk, other=0).to(tl.float32)
+        _v = tl.load(p_v, mask=mask_bv, other=0).to(tl.float32)
+        _v_minus = tl.sum(h * _k[:, None], axis=0)
+        _v -= _v_minus
+        _beta = tl.load(p_beta).to(tl.float32)
+        # in-place overwrite
+        tl.store(p_v, _v.to(p_v.dtype.element_ty), mask=mask_bv)
+        _v *= _beta
+        h += _k[:, None] * _v[None, :]
+        tl.store(p_h, h.to(p_h.dtype.element_ty), mask=mask_kv)
 
-    for i in range(1, BT):
-        mask = tl.arange(0, BT) == i
-        b_a = tl.sum(tl.where(mask[:, None], b_A, 0), 0)
-        b_a = b_a + tl.sum(b_a[:, None] * b_A, 0) * (tl.arange(0, BT) < i)
-        b_A = tl.where(mask[:, None], b_a, b_A)
-
-    b_A += tl.arange(0, BT)[:, None] == tl.arange(0, BT)[None, :]
-
-    p_A = tl.make_block_ptr(A + i_bh * T * BT, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    tl.store(p_A, (b_A).to(p_A.dtype.element_ty), boundary_check=(0, 1))
-    b_A = b_A.to(k.dtype.element_ty)
-
-    for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(
-            v + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-        )
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
-        b_u = tl.dot(b_A, b_vb, allow_tf32=False)
-        p_u = tl.make_block_ptr(
-            u + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-        )
-        tl.store(p_u, (b_u).to(p_u.dtype.element_ty), boundary_check=(0, 1))
-
-    for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_kb = (b_k * b_beta[:, None]).to(b_k.dtype)
-        b_w = tl.dot(b_A, b_kb, allow_tf32=False)
-        p_w = tl.make_block_ptr(
-            w + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-        )
-        tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
+        p_k += DK
+        p_v += DV
+        p_h += DK * DV
+        p_beta += 1
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
-    ],
-    key=["BT", "BK", "BV"],
-)
 @triton.jit
-def fwd_recompute_w_u_kernel(
-    k,
-    v,
-    beta,
-    w,
-    u,
-    A,
-    s_qk_h,
-    s_qk_t,
-    s_qk_d,
-    s_vo_h,
-    s_vo_t,
-    s_vo_d,
-    T,
-    K,
-    V,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
+def fused_recurrent_bwd_kernel(
+    # B: batch_size, T: seq_len, D: d_head
+    # NV: number of split in the V dimension. NK: number of split in the K dimension
+    h,  # output [B, L, D_K, D_V]
+    k,  # key [B, L, DW_V]
+    v,  # value [B, L, D_V]
+    beta,  # beta [B, L]
+    do,  # gradient of output [B, L, D_K, D_V]
+    dk,  # gradient of key [NV, B, L, D_K]
+    dv,  # gradient of value [NK, B, L, D_V]
+    dbeta,  # gradient of beta [B, H, L]
+    # initial hidden state initialization [B, H, D_head_K, D_head_V]
+    initial_state,
+    s_k_b,  # stride size: L * D_K
+    s_k_t,  # stride size: D_K
+    s_k_d,  # stride size: 1
+    s_v_b,  # stride size: L * D_V
+    s_v_t,  # stride size: D_V
+    s_v_d,  # stride size: 1
+    s_h_b,  # stride size: L * D_K * D_V
+    s_h_t,  # stride size: D_K * D_V
+    s_h_dk,  # stride size: D_V
+    s_h_dv,  # stride size: 1
+    s_beta,  # stride size: L
+    B,  # batch_size
+    T,  # seq_len
+    BK: tl.constexpr,  # BLOCK SIZE along the K dimension
+    DK: tl.constexpr,  # D_K
+    DV: tl.constexpr,  # D_V
+    USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_k, i_bh = tl.program_id(0), tl.program_id(1)
+    mask_bk = i_k * BK + tl.arange(0, BK) < DK
+    mask_bv = tl.arange(0, DV) < DV
+    mask_kv = mask_bk[:, None] & mask_bv[None, :]
 
-    p_beta = tl.make_block_ptr(beta + i_bh * T, (T,), (1,), (i_t * BT,), (BT,), (0,))
-    b_beta = tl.load(p_beta, boundary_check=(0,))
-
-    p_A = tl.make_block_ptr(A + i_bh * T * BT, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    b_A = tl.load(p_A, boundary_check=(0, 1)).to(k.dtype.element_ty)
-
-    for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(
-            v + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-        )
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
-        b_u = tl.dot(b_A, b_vb, allow_tf32=False)
-        p_u = tl.make_block_ptr(
-            u + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-        )
-        tl.store(p_u, (b_u).to(p_u.dtype.element_ty), boundary_check=(0, 1))
-
-    for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_kb = (b_k * b_beta[:, None]).to(b_k.dtype)
-        b_w = tl.dot(b_A, b_kb, allow_tf32=False)
-        p_w = tl.make_block_ptr(
-            w + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-        )
-        tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
-    ],
-    key=["BT", "BK", "BV"],
-)
-@triton.jit
-def bwd_prepare_wy_repr_kernel(
-    k,
-    v,
-    beta,
-    A,
-    dw,
-    du,
-    dk,
-    dv,
-    dbeta,
-    s_qk_h,
-    s_qk_t,
-    s_qk_d,
-    s_vo_h,
-    s_vo_t,
-    s_vo_d,
-    T,
-    K,
-    V,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    p_A = tl.make_block_ptr(A + i_bh * T * BT, (T, BT), (BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    b_A = tl.load(p_A, boundary_check=(0, 1)).to(k.dtype.element_ty)
-
-    b_dbeta = tl.zeros([BT], dtype=tl.float32)
-    b_dA = tl.zeros([BT, BT], dtype=tl.float32)
-    p_beta = tl.make_block_ptr(beta + i_bh * T, (T,), (1,), (i_t * BT,), (BT,), (0,))
-    b_beta = tl.load(p_beta, boundary_check=(0,))
-
-    for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(
-            v + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-        )
-        p_du = tl.make_block_ptr(
-            du + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-        )
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_v_beta = (b_v * b_beta[:, None]).to(b_v.dtype)
-        b_du = tl.load(p_du, boundary_check=(0, 1))
-        b_dA += tl.dot(b_du, tl.trans(b_v_beta), allow_tf32=False)
-        b_dv_beta = tl.dot(tl.trans(b_A), b_du, allow_tf32=False)
-        b_dv = b_dv_beta * b_beta[:, None]
-        b_dbeta += tl.sum(b_dv_beta * b_v, 1)
-        # store
-        p_dv = tl.make_block_ptr(
-            dv + i_bh * s_vo_h, (T, V), (s_vo_t, s_vo_d), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-        )
-        tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
-
-    tl.debug_barrier()
-    b_A2 = tl.zeros([BT, BT], dtype=tl.float32)
-    for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-        )
-        p_dw = tl.make_block_ptr(
-            dw + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_k_beta = (b_k * b_beta[:, None]).to(b_k.dtype)
-        b_dw = tl.load(p_dw, boundary_check=(0, 1))
-        b_dA += tl.dot(b_dw, tl.trans(b_k_beta), allow_tf32=False)
-        b_A2 += tl.dot(b_k_beta, tl.trans(b_k), allow_tf32=False)
-        b_dk_beta = tl.dot(tl.trans(b_A), b_dw, allow_tf32=False)
-        b_dk = b_dk_beta * b_beta[:, None]
-        b_dbeta += tl.sum(b_dk_beta * b_k, 1)
-        # store
-        p_dk = tl.make_block_ptr(
-            dk + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-        )
-        tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
-
-    b_A -= tl.arange(0, BT)[:, None] == tl.arange(0, BT)[None, :]
-    b_A2 = tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], -b_A2, 0)
-    b_dA = tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], b_dA, 0)
-    tl.debug_barrier()
-
-    for i in range(BT - 1, 0, -1):
-        mask = tl.arange(0, BT) == i
-        b_da = tl.sum(tl.where(mask[:, None], b_dA, 0), 0)
-        b_a = tl.sum(tl.where(mask[:, None], b_A2, 0), 0)
-        b_da2 = b_da + tl.sum(b_da[None, :] * b_A, 1)
-        b_dA = tl.where(mask[:, None], b_da2, b_dA)
-        b_dA += b_da[None, :] * b_a[:, None]
-
-    b_dA = tl.where(tl.arange(0, BT)[:, None] > tl.arange(0, BT)[None, :], -b_dA, 0).to(k.dtype.element_ty)
-    tl.debug_barrier()
-
-    for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-        )
-        p_dk = tl.make_block_ptr(
-            dk + i_bh * s_qk_h, (T, K), (s_qk_t, s_qk_d), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_dk = tl.load(p_dk, boundary_check=(0, 1))
-        b_k_beta = (b_k * b_beta[:, None]).to(b_k.dtype)
-
-        b_dk_beta = tl.dot(b_dA, b_k, allow_tf32=False)
-        b_dbeta += tl.sum(b_dk_beta * b_k, 1)
-        b_dk += tl.dot(tl.trans(b_dA), b_k_beta, allow_tf32=False)
-        b_dk += b_dk_beta * b_beta[:, None]
-        tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
-
-    p_dbeta = tl.make_block_ptr(dbeta + i_bh * T, (T,), (1,), (i_t * BT,), (BT,), (0,))
-    tl.store(p_dbeta, b_dbeta.to(p_dbeta.dtype.element_ty), boundary_check=(0,))
-
-
-def fwd_prepare_wy_repr(k, v, beta, BT):
-    B, H, T, K, V = *k.shape, v.shape[-1]
-    u = torch.empty_like(v)
-    w = torch.empty_like(k)
-    NT = triton.cdiv(T, BT)
-    BK = min(triton.next_power_of_2(K), 64)
-    BV = min(triton.next_power_of_2(V), 64)
-    A = torch.empty(B, H, T, BT, device=k.device, dtype=k.dtype)
-    fwd_prepare_wy_repr_kernel[(NT, B * H)](
-        k,
-        v,
-        beta,
-        w,
-        u,
-        A,
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        T,
-        K,
-        V,
-        BT,
-        BK,
-        BV,
+    p_k = k + i_bh * s_k_b + i_k * BK + tl.arange(0, BK) + (T - 1) * DK
+    p_v = v + i_bh * s_v_b + tl.arange(0, DV) + (T - 1) * DV
+    p_h = (
+        h
+        + i_bh * s_h_b
+        + (i_k * BK + tl.arange(0, BK)[:, None]) * DV
+        + (tl.arange(0, DV)[None, :])
+        + (T - 2) * DK * DV
     )
-    return w, u, A
+    p_beta = beta + i_bh * T + T - 1
 
-
-def fwd_recompute_w_u(k, v, beta, A, BT):
-    B, H, T, K, V = *k.shape, v.shape[-1]
-    u = torch.empty_like(v)
-    w = torch.empty_like(k)
-    NT = triton.cdiv(T, BT)
-    BK = min(triton.next_power_of_2(K), 64)
-    BV = min(triton.next_power_of_2(V), 64)
-    fwd_recompute_w_u_kernel[(NT, B * H)](
-        k,
-        v,
-        beta,
-        w,
-        u,
-        A,
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        T,
-        K,
-        V,
-        BT,
-        BK,
-        BV,
+    p_do = (
+        do
+        + i_bh * s_h_b
+        + (i_k * BK + tl.arange(0, BK)[:, None]) * DV
+        + (tl.arange(0, DV)[None, :])
+        + (T - 1) * DK * DV
     )
-    return w, u
+    p_dbeta = dbeta + (i_bh + i_k * B) * T + T - 1
+    p_dk = dk + i_bh * s_k_b + i_k * BK + tl.arange(0, BK) + (T - 1) * DK
+    p_dv = dv + (i_bh + i_k * B) * s_v_b + tl.arange(0, DV) + (T - 1) * DV
+
+    d_h = tl.zeros([BK, DV], dtype=tl.float32)
+
+    for i in range(T):
+        _do = tl.load(p_do, mask=mask_kv, other=0).to(tl.float32)  # D_K, D_V
+        if i < T - 1:
+            _h = tl.load(p_h, mask=mask_kv, other=0).to(tl.float32)
+        else:
+            _h = tl.zeros([BK, DV], dtype=tl.float32)
+            if USE_INITIAL_STATE:
+                p_init_s = (
+                    initial_state
+                    + i_bh * s_h_t
+                    + (i_k * BK + tl.arange(0, BK)[:, None]) * DV
+                    + (tl.arange(0, DV)[None, :])
+                )
+                _h += tl.load(p_init_s, mask=mask_kv, other=0).to(tl.float32)
+        _k = tl.load(p_k, mask=mask_bk, other=0).to(tl.float32)
+        _v = tl.load(p_v, mask=mask_bv, other=0).to(tl.float32)
+        _beta = tl.load(p_beta).to(tl.float32)
+
+        d_h += _do
+
+        d_v = tl.sum(d_h * _k[:, None], axis=0)
+        d_beta = tl.sum(d_v * _v)
+        d_v = d_v * _beta
+
+        d_k = tl.sum(d_h * _v[None, :] * _beta, axis=1)
+        d_k -= tl.sum(d_v[None, :] * _h, axis=1)
+
+        tl.store(p_dk, d_k.to(p_dk.dtype.element_ty), mask=mask_bk)
+        tl.store(p_dv, d_v.to(p_dv.dtype.element_ty), mask=mask_bv)
+        tl.store(p_dbeta, d_beta.to(p_dbeta.dtype.element_ty))
+
+        d_h -= _k[:, None] * d_v[None, :]
+
+        p_do -= DV * DK
+        p_h -= DV * DK
+        p_k -= DK
+        p_v -= DV
+        p_dk -= DK
+        p_dv -= DV
+        p_dbeta -= 1
+        p_beta -= 1
 
 
-def bwd_prepare_wy_repr(k, v, beta, A, dw, du, BT):
-    B, H, T, K, V = *k.shape, v.shape[-1]
-
-    NT = triton.cdiv(T, BT)
-    BK = min(triton.next_power_of_2(K), 64)
-    BV = min(triton.next_power_of_2(V), 64)
-    NT = triton.cdiv(T, BT)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v).contiguous()
-    dbeta = torch.zeros_like(beta)
-
-    bwd_prepare_wy_repr_kernel[(NT, B * H)](
-        k,
-        v,
-        beta,
-        A,
-        dw,
-        du,
-        dk,
-        dv,
-        dbeta,
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        T,
-        K,
-        V,
-        BT,
-        BK,
-        BV,
-    )
-    return dk, dv, dbeta
-
-
-class WYRepresentationPrepration(torch.autograd.Function):
-    @staticmethod
-    @contiguous
-    @custom_fwd
-    def forward(ctx, k, v, beta, chunk_size):
-        ctx.BT = chunk_size
-        w, u, A = fwd_prepare_wy_repr(k, v, beta, ctx.BT)
-        ctx.save_for_backward(k, v, beta, A)
-        return w, u
+class FusedRecurrentFunction(torch.autograd.Function):
 
     @staticmethod
     @contiguous
-    @custom_bwd
-    def backward(ctx, dw, du):
-        k, v, beta, A = ctx.saved_tensors
-        BT = ctx.BT
-        dk, dv, dbeta = bwd_prepare_wy_repr(k, v, beta, A, dw, du, BT)
-        return dk, dv, dbeta, None
+    def forward(ctx, k, v, beta, initial_state=None):
+        batch_size, seq_len, dim_k = k.shape
+        dim_v = v.shape[-1]
+
+        BK = min(triton.next_power_of_2(dim_v), 64)
+        NK = triton.cdiv(dim_k, BK)
+        num_stages = 1
+        num_warps = 4
+
+        h = torch.empty(batch_size, seq_len, dim_k, dim_v, device=k.device, dtype=k.dtype)
+
+        grid = (NK, batch_size)
+        fused_recurrent_fwd_kernel[grid](
+            k,
+            v,
+            beta,
+            h,
+            initial_state,
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            h.stride(0),
+            h.stride(1),
+            h.stride(2),
+            h.stride(3),
+            beta.stride(0),
+            batch_size,
+            seq_len,
+            DK=dim_k,
+            DV=dim_v,
+            BK=BK,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            USE_INITIAL_STATE=initial_state is not None,
+        )
+        ctx.save_for_backward(h, k, v, beta, initial_state)
+        return h
+
+    @staticmethod
+    @contiguous
+    def backward(ctx, do):
+        h, k, v, beta, initial_state = ctx.saved_tensors
+        batch_size, seq_len, dim_k, dim_v = h.shape
+        BK = min(triton.next_power_of_2(dim_v), 64)
+        NK = triton.cdiv(dim_k, BK)
+        num_stages = 1
+        num_warps = 4
+
+        dk = k.new_empty(batch_size, seq_len, dim_k)
+        dv = v.new_empty(NK, batch_size, seq_len, dim_v)
+        dbeta = beta.new_empty(NK, batch_size, seq_len)
+        grid = (NK, batch_size)
+
+        fused_recurrent_bwd_kernel[grid](
+            h,
+            k,
+            v,
+            beta,
+            do,
+            dk,
+            dv,
+            dbeta,
+            initial_state,
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            h.stride(0),
+            h.stride(1),
+            h.stride(2),
+            h.stride(3),
+            beta.stride(0),
+            batch_size,
+            seq_len,
+            DK=dim_k,
+            DV=dim_v,
+            BK=BK,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            USE_INITIAL_STATE=initial_state is not None,
+        )
+        dv = dv.sum(0)
+        dbeta = dbeta.sum(0)
+        return dk.to(k), dv.to(v), dbeta.to(beta), None, None
 
 
-prepare_wy_repr = WYRepresentationPrepration.apply
+def fused_recurrent_linear_attn_delta_rule(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor = None,
+    initial_state: torch.Tensor = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if initial_state is not None:
+        initial_state = initial_state.detach()
+    final_state = FusedRecurrentFunction.apply(k, v, beta, initial_state)
+    return final_state
 
 
-def naive(k, v, beta, chunk_size):
-    l_org = k.shape[2]
-    l_new = triton.next_power_of_2(l_org)
-    # pad k, v, beta
-    k = torch.cat([k, torch.zeros_like(k)[:, :, : l_new - l_org, :]], dim=2)
-    v = torch.cat([v, torch.zeros_like(v)[:, :, : l_new - l_org, :]], dim=2)
-    beta = torch.cat([beta, torch.zeros_like(beta)[:, :, : l_new - l_org]], dim=2)
+def fused_recurrent_linear_attn_delta_rule_ref(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor = None,
+    initial_state: torch.Tensor = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if initial_state is not None:
+        initial_state = initial_state.detach()
 
-    k, v = map(lambda x: rearrange(x, "b h (n c) d -> b h n c d", c=chunk_size), (k, v))
-    # k = torch.nn.functional.normalize(k, dim=-1, p=2)
-    beta = rearrange(beta, "b h (n c) -> b h n c", c=chunk_size)
-    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=k.device), diagonal=0)
-    k_beta = k * beta[..., None]
-    v = v * beta[..., None]
-    attn = (k @ k.transpose(-1, -2)).masked_fill_(mask, 0)
-    attn = attn * beta[..., None]
-    x = attn @ v
+    batch_size, seq_len, d_k = k.shape
+    d_v = v.shape[-1]
 
-    o = torch.zeros_like(k)
-    o2 = torch.zeros_like(v)
+    h0 = torch.zeros(batch_size, d_k, d_v, device=k.device, dtype=k.dtype)
+    h = []
 
-    o[..., 0, :] = k_beta[..., 0, :].clone()
-    o2[..., 0, :] = x[..., 0, :].clone()
-    for i in range(1, chunk_size):
-        o_i = (o[..., :i, :]).clone()
-        o[..., i, :] = -(attn[..., i, :i, None] * o_i).sum(3) + k_beta[..., i, :]
-        o2_i = (o2[..., :i, :]).clone()
-        o2[..., i, :] = -(attn[..., i, :i, None] * o2_i).sum(3) + x[..., i, :]
-    return map(lambda x: rearrange(x, "b h n c d -> b h (n c) d")[:, :, :l_org], (o, v - o2))
+    if initial_state is not None:
+        h0 += initial_state
+
+    for i in range(seq_len):
+        _k = k[:, i]  # B, D_K
+        _v = v[:, i]  # B, D_V
+        _beta = beta[:, i].unsqueeze(1) if beta is not None else 1
+        _v_minus = torch.einsum("bkv, bk->bv", h0, _k)
+        _v = _v - _v_minus
+        _v = _v * _beta
+        h0 = h0.clone() + torch.einsum("bk, bv->bkv", _k, _v)
+        h.append(h0)
+
+    h = torch.stack(h, dim=1)
+    return h
 
 
 if __name__ == "__main__":
-    torch.set_default_dtype(torch.float32)
-    seq_len = 1024
-    b = 4
-    h = 4
-    k = torch.nn.functional.normalize(torch.randn(b, h, seq_len, 128), dim=-1, p=2)
-    v = torch.randn(b, h, seq_len, 128)
-    beta = torch.rand(b, h, seq_len).sigmoid()
-    # beta = torch.ones(b, h, seq_len)
-    require_grad = True
+    B = 8
+    L = 1024
+    DK = 2048
+    DV = 128
+    k = (torch.randn(B, L, DK)).cuda()
+    k = torch.nn.functional.normalize(k, dim=-1, p=2).requires_grad_(True)
+    v = (torch.randn(B, L, DV)).cuda().requires_grad_(True)
+    beta = torch.randn(B, L).cuda().sigmoid().requires_grad_(True)
+    do = torch.randn(B, L, DK, DV).cuda()
 
-    k, v, beta = map(lambda x: x.cuda().requires_grad_(require_grad), (k, v, beta))
-    do = torch.rand_like(k)
-    do2 = torch.rand_like(v)
+    # reference
+    o = fused_recurrent_linear_attn_delta_rule_ref(k, v, beta)
+    o.backward(do, retain_graph=True)
+    k_grad, k.grad = k.grad, None
+    v_grad, v.grad = v.grad, None
+    beta_grad, beta.grad = beta.grad, None
 
-    o1, o2 = naive(k.clone(), v.clone(), beta.clone(), 64)
-    if require_grad:
-        o1.backward(do, retain_graph=True)
-        o2.backward(do2, retain_graph=True)
-
-        k_grad2, v_grad2, beta_grad2 = k.grad, v.grad, beta.grad
-        k.grad = v.grad = beta.grad = None
-
-    o3, o4 = prepare_wy_repr(k.clone(), v.clone(), beta.clone())
-    print((o1 - o3).abs().max())
-    print((o2 - o4).abs().max())
-
-    if require_grad:
-        o3.backward(do, retain_graph=True)
-        o4.backward(do2, retain_graph=True)
-        k_grad, v_grad, beta_grad = k.grad, v.grad, beta.grad
-        print((k_grad2 - k_grad).abs().max())
-        print((v_grad2 - v_grad).abs().max())
-        print((beta_grad2 - beta_grad).abs().max())
-    breakpoint()
+    o2 = fused_recurrent_linear_attn_delta_rule(k, v, beta)
+    o2.backward(do)
+    print(o, o2)
+    print("All passed!")

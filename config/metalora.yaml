@@ -32,7 +32,7 @@ scheduler:
   grad_clip_warmup_steps: null
   grad_clip_warmup_factor: null
 data:
-  paths: pile
+  paths: redpajama
   num_workers: 2
   drop_last: true
   pin_memory: true

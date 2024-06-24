@@ -72,6 +72,9 @@ class TrainerModel(nn.Module):
                                 "out_recurrent_module",
                                 "ffn_up_proj",
                                 "ffn_down_proj",
+                                "query_norm",
+                                "key_norm",
+                                "value_norm",
                             ]
                         ]
                     ):

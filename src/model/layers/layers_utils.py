@@ -3,6 +3,8 @@ import numbers
 import torch
 import torch.nn as nn
 
+from .ops import fused_recurrent_linear_attn_delta_rule
+
 
 def manual_rms_norm(input, normalized_shape, weight, eps):
     # layer norm should always be calculated in float32
@@ -47,8 +49,8 @@ class DeltaRecurrentUpdate(nn.Module):
         super().__init__()
 
         self.key_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.value_proj = nn.Linear(hidden_size, low_rank_factor * low_rank_factor, bias=False)
-        self.gating_func = nn.Linear(hidden_size, low_rank_factor * low_rank_factor, bias=False)
+        self.value_proj = nn.Linear(hidden_size, low_rank_factor, bias=False)
+        self.gating_func = nn.Linear(hidden_size, 1, bias=False)
         # self.in_norm = FusedRMSNorm(hidden_size)
 
     def forward(self, hidden_states: torch.Tensor, prev_cache: torch.Tensor):
@@ -56,17 +58,9 @@ class DeltaRecurrentUpdate(nn.Module):
         key_states = self.key_proj(hidden_states)  # B x L x H
         key_states = torch.nn.functional.silu(key_states)
         value_states = self.value_proj(hidden_states)  # B x L x H
+        beta = self.gating_func(hidden_states)
+        beta = torch.sigmoid(beta).squeeze()
 
-        if prev_cache is not None:
-            gating = self.gating_func(hidden_states)
-            gating = torch.sigmoid(gating)
-            value_states = gating * value_states - (1 - gating) * torch.einsum(
-                "b l h, b h d -> b l d", key_states, prev_cache
-            )
-            new_cache = prev_cache + torch.einsum("b l h, b l d -> b h d", key_states, value_states)
-        else:
-            new_cache = torch.einsum("b l h, b l d -> b h d", key_states, value_states)
+        all_h = fused_recurrent_linear_attn_delta_rule(key_states, value_states, beta, prev_cache)
 
-        # new_cache = torch.nn.functional.normalize(new_cache, p=2, dim=-1)
-        # new_cache = self.output_norm(new_cache)
-        return new_cache
+        return all_h[:, -1]
