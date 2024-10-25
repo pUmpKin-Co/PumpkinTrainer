@@ -766,7 +766,7 @@ class TrainConfig(BaseConfig):
                     "type": "AdamW",
                     "params": {
                         "lr": self.optimizer.learning_rate,
-                        "eps": 1e-8,
+                        "eps": 1e-6,
                         "betas": self.optimizer.betas,
                         "weight_decay": self.optimizer.weight_decay,
                     },

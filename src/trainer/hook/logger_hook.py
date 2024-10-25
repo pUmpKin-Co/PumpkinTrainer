@@ -41,9 +41,6 @@ class LoggerHook(HookBase):
         self._entity = entity
 
     def before_train(self) -> None:
-        if self.wandb:
-            wandb.watch(self.trainer.model_or_module, log="parameters", log_freq=self._period)
-
         self._train_start_time = time.perf_counter()
 
     def after_train(self) -> None:

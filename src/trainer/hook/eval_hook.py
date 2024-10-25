@@ -45,14 +45,12 @@ class EvalHook(HookBase):
 
     def perplexity_eval_func(self):
         self.trainer.model.eval()
-        self.trainer.model.clear_cache()
         total_tokens = 0
         total_ppl = 0
-        self.trainer.model.clear_cache()
 
         for batch in tqdm(self.trainer.eval_data_loader, desc="Evaluating", disable=get_rank() != 0):
             batch = self.trainer.put_input_to_device(batch)
-            new_tokens = batch["new_tokens"]
+            new_tokens = batch["input_ids"].shape[1]
             inputs = {k: batch[k] for k in ["input_ids", "attention_mask", "labels"]}
             with (
                 torch.autocast(
@@ -62,7 +60,7 @@ class EvalHook(HookBase):
                 )
                 and torch.inference_mode()
             ):
-                outputs = self.trainer.model(**inputs, should_build=True)
+                outputs = self.trainer.model(**inputs)
             loss = outputs.loss
             ppl = loss.exp().item()
 

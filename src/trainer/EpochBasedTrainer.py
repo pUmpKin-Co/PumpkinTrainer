@@ -1,7 +1,7 @@
 import logging
 from typing import List
 
-from .hook import HookBase, LoggerHook, DistributedHook
+from .hook import DistributedHook, HookBase, LoggerHook
 from .trainer import Trainer
 from .utils import collect_env, is_main_process
 
@@ -63,16 +63,13 @@ class EpochBasedTrainer(Trainer):
         self.model.train()
         for self.inner_iter in range(self.inner_iter, self.epoch_len):
             self._call_hooks("before_iter")
-            # for name, param in self.model_or_module.named_parameters():
-            #     if param.requires_grad:
-            #         print(name)
-
             self.train_on_iter()
             self._call_hooks("after_iter")
         self._data_iter = iter(self.data_loader)
 
     def sub_classes_train(self):
         logger.info(f"Start training from epoch {self.start_epoch} to {self.max_epochs}.")
+        self.log_trainable_params()
         for self.epoch in range(self.start_epoch, self.max_epochs):
             self._call_hooks("before_epoch")
             self._train_one_epoch()

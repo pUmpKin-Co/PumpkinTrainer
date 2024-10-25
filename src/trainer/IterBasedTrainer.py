@@ -57,6 +57,7 @@ class IterBasedTrainer(Trainer):
     def sub_classes_train(self):
         logger.info(f"Start training from iteration {self.inner_iter} to {self.target_iters}")
         self.model.train()
+        self.log_trainable_params()
         for self.inner_iter in range(self.start_iter, self.target_iters):
             self._call_hooks("before_iter")
             self.train_on_iter()

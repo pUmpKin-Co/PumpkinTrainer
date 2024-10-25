@@ -549,6 +549,15 @@ class Trainer:
         self.sub_classes_train()
         self._call_hooks("after_train")
 
+    def log_trainable_params(self):
+        """
+        Log trainable parameters.
+        """
+        total_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        # Convert to MB
+        total_params = total_params / 1e6
+        logger.info(f"Total trainable parameters: {total_params:.2f}M")
+
     def put_input_to_device(self, modal_input: Union[torch.Tensor, List, Dict, Tuple]):
         if isinstance(modal_input, tuple):
             modal_input = tuple([item.to(device=self.device) for item in modal_input])
