@@ -1,13 +1,17 @@
 import logging
 import sys
 from dataclasses import dataclass, field
+from functools import partial
+from itertools import chain
 from pathlib import Path
+from typing import Union
 
 import torch
 import wandb
+from datasets import load_dataset, load_from_disk
 from packaging import version
-from src.data.build_data import build_loader, build_pg_loader
-from src.model.build_model import build
+from src.model.model_config import TransformerConfig350M
+from src.model.transformer import TransformerForCausalLM
 from src.trainer.EpochBasedTrainer import EpochBasedTrainer
 from src.trainer.hook.eval_hook import EpochEvalHook, IterEvalHook
 from src.trainer.IterBasedTrainer import IterBasedTrainer
@@ -15,7 +19,6 @@ from src.trainer.optimizer import build_optimizer
 from src.trainer.utils import (
     CustomTrainerConfigError,
     DataConfig,
-    ModelConfig,
     TrainConfig,
     barrier,
     deepspeed_init_distributed,
@@ -26,52 +29,169 @@ from src.trainer.utils import (
     setup_logger,
 )
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from transformers import AutoTokenizer, default_data_collator
 
 logger = logging.getLogger("train")
 
 
 @dataclass
-class CustomModelConfig(ModelConfig):
-    name: str = "gpt2"
-    max_seq_length: int = 2048
-    chunk_size: int = 512
-    use_flash_attention_2: bool = True
-    low_rank_factor: int = 64
-
-
-@dataclass
 class CustomDataConfig(DataConfig):
-    cache_path: str = "~/pile_tinyllama"
+    tokenizer: str = "mistralai/Mistral-7B-Instruct-v0.2"
+    data: str = "cerebras/SlimPajama-627B"
+    cache_path: str = "~/cache_data"
+    training_size: Union[int, str] = "100B"
+    validation_size: Union[int, str] = "10B"
 
 
 @dataclass
 class CustomTrainConfig(TrainConfig):
-    model: CustomModelConfig = field(default_factory=CustomModelConfig)
+    model: TransformerConfig350M = field(default_factory=TransformerConfig350M)
     data: CustomDataConfig = field(default_factory=CustomDataConfig)
 
 
 def main(config: TrainConfig):
     logger.info(f"Creating model")
-    model, tokenizer = build(config.model)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.data.tokenizer)
+    model = TransformerForCausalLM(config.model)
+
+    # Load data
+    def tokenizer_fn(examples):
+        return tokenizer(examples["text"])
+
+    def group_fn(examples, block_size):
+        # Concatenate all texts.
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+        # customize this part to your needs.
+        if total_length >= block_size:
+            total_length = (total_length // block_size) * block_size
+        # Split by chunks of max_len.
+        result = {
+            k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
+            for k, t in concatenated_examples.items()
+        }
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    root_path = Path(config.data.cache_path)
+    if not Path(config.data.cache_path).exists():
+        logger.info(f"Loading dataset from {config.data.data}")
+        dataset = load_dataset(
+            config.data.data,
+            trust_remote_code=True,
+            split="train",
+        )
+
+        dataset = dataset.map(
+            tokenizer_fn, batched=True, remove_columns=["text"], num_proc=8, desc="Tokenizing dataset"
+        )
+
+        dataset = dataset.map(
+            partial(group_fn, block_size=config.model.max_position_embeddings),
+            batched=True,
+            num_proc=8,
+            desc="Grouping texts",
+        )
+
+        val_dataset = load_dataset(
+            config.data.data,
+            trust_remote_code=True,
+            split="validation",
+        )
+
+        val_dataset = val_dataset.map(
+            tokenizer_fn, batched=True, remove_columns=["text"], num_proc=8, desc="Tokenizing dataset"
+        )
+
+        val_dataset = val_dataset.map(
+            partial(group_fn, block_size=config.model.max_position_embeddings),
+            batched=True,
+            num_proc=8,
+            desc="Grouping texts",
+        )
+
+        train_path = root_path / "train"
+        train_path.mkdir(exist_ok=True, parents=True)
+        dataset.save_to_disk(train_path)
+
+        val_path = root_path / "validation"
+        val_path.mkdir(exist_ok=True, parents=True)
+        val_dataset.save_to_disk(val_path)
+    else:
+        logger.info(f"Loading dataset from {config.data.cache_path}")
+        dataset = load_from_disk(config.data.cache_path)
+        val_dataset = load_from_disk(config.data.cache_path)
+
+    exit(1)
+    training_size = config.data.training_size
+    validation_size = config.data.validation_size
+
+    if isinstance(training_size, str):
+        digits = training_size[:-1]
+        unit = training_size[-1]
+
+        assert unit in ["B", "M", "T"], f"Invalid unit {unit}"
+        training_size = int(digits)
+        if unit == "M":
+            training_size *= 1e6
+        elif unit == "T":
+            training_size *= 1e12
+        elif unit == "B":
+            training_size *= 1e9
+    else:
+        training_size = int(training_size)
+
+    select_size = training_size // config.model.max_position_embeddings
+    train_dataset = dataset.select(range(select_size))
+
+    if isinstance(validation_size, str):
+        digits = validation_size[:-1]
+        unit = validation_size[-1]
+
+        assert unit in ["B", "M", "T"], f"Invalid unit {unit}"
+        validation_size = int(digits)
+        if unit == "M":
+            validation_size *= 1e6
+        elif unit == "T":
+            validation_size *= 1e12
+        elif unit == "B":
+            validation_size *= 1e9
+    else:
+        validation_size = int(validation_size)
+
+    select_size = validation_size // config.model.max_position_embeddings
+    eval_dataset = val_dataset.select(range(select_size))
 
     logger.info(f"Creating dataloader")
-    dataloader = build_loader(
-        tokenizer,
+
+    if not config.is_distribute:
+        sampler = None
+    else:
+        sampler = torch.utils.data.DistributedSampler(train_dataset)
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
         batch_size=config.device_train_batch_size,
-        max_seq_length=config.model.max_seq_length,
-        data_config=config.data,
+        shuffle=True if sampler is None else False,
+        sampler=sampler,
+        pin_memory=True,
+        collate_fn=default_data_collator,
     )
 
-    logger.info(f"Creating Evaluation dataloader")
-    eval_dataloader = build_pg_loader(
-        tokenizer,
-        chunk_size=config.model.chunk_size,
-        file_path=config.evaluators.data.paths,
+    eval_loader = torch.utils.data.DataLoader(
+        eval_dataset,
+        batch_size=config.device_eval_batch_size,
+        shuffle=False,
+        sampler=None,
+        pin_memory=True,
+        collate_fn=default_data_collator,
     )
 
     if hasattr(model, "gradient_checkpointing_enable") and config.activation_checkpointing:
-        model.model.gradient_checkpointing_enable()
-        model.model.enalbe_input_requre_grads()
+        model.gradient_checkpointing_enable()
+        model.enalbe_input_requre_grads()
 
     if config.fsdp.enabled:
         if hasattr(model, "get_fsdp_wrap_policy"):
@@ -147,7 +267,7 @@ def main(config: TrainConfig):
         "model": model,
         "optimizer": optimizer,
         "lr_scheduler": config.scheduler,
-        "data_loader": dataloader,
+        "data_loader": train_loader,
         "work_dir": config.save_folder,
         "max_num_checkpoints": config.checkpoint.save_num_checkpoints_to_keep,
         "log_period": config.console_log_interval,
@@ -163,7 +283,7 @@ def main(config: TrainConfig):
         "torch_compile": config.compile,
         "dtype": config.autocast_precision,
         "save_ckpt_by": config.checkpoint.save_strategy,
-        "eval_data_loader": eval_dataloader,
+        "eval_data_loader": eval_loader,
     }
 
     if config.run_strategy == "step":

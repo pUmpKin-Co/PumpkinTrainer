@@ -24,6 +24,9 @@ dependencies = [
     "timm",
     "safetensors",
     "tensorboard",
+	"transformers==4.46.0",
+	"einops",
+	"datasets"
 ]
 
 [project.urls]

@@ -15,10 +15,11 @@ from transformers.modeling_outputs import (
 from transformers.modeling_utils import PreTrainedModel
 
 from .activations import swiglu_linear
-from .model_config import TransformerConfig
-from .utils import FlashAttention, RMSNorm
+from .attention import FlashAttention
+from .layernorm import RMSNorm
+from .model_config import TransformerConfig350M
 
-logger = logging.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class SwiGLUMLP(nn.Module):
@@ -44,6 +45,7 @@ class SwiGLUMLP(nn.Module):
 
 class MoEGate(nn.Module):
     def __init__(self, config):
+        super().__init__()
         self.config = config
         self.top_k = config.activate_expert
         self.num_experts = config.num_experts
@@ -246,7 +248,7 @@ class TransformerBlock(nn.Module):
 
 class TransformerPreTrainedModel(PreTrainedModel):
 
-    config_class = TransformerConfig
+    config_class = TransformerConfig350M
     supports_gradient_checkpointing = True
     _no_split_modules = ["TransformerBlock"]
 
@@ -273,56 +275,13 @@ class TransformerPreTrainedModel(PreTrainedModel):
         if rescale_prenorm_residual:
             for name, p in module.named_parameters():
                 if name in ["o_proj.weight", "down_proj.weight"]:
-                    with torch.no_grad():
-                        p /= math.sqrt(num_residuals_per_layer * self.config.num_hidden_layers)
-
-
-class TransformerPreTrainedModel(PreTrainedModel):
-
-    config_class = TransformerConfig
-    supports_gradient_checkpointing = True
-    _no_split_modules = ["TransformerBlock"]
-
-    def __init__(self, *inputs, **kwargs):
-        super().__init__(*inputs, **kwargs)
-
-    def _init_weights(
-        self,
-        module: nn.Module,
-        rescale_prenorm_residual: bool = True,
-        num_residuals_per_layer: int = 2,
-    ):
-        if isinstance(module, (nn.Linear, nn.Conv1d)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
-            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-
-        if rescale_prenorm_residual:
-            # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
-            #   > A modified initialization which accounts for the accumulation on the residual path with model depth. Scale
-            #   > the weights of residual layers at initialization by a factor of 1/√N where N is the # of residual layers.
-            #   >   -- GPT-2 :: https://openai.com/blog/better-language-models/
-            #
-            # Reference (Megatron-LM): https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/model/gpt_model.py
-            for name, p in module.named_parameters():
-                if name in ["o_proj.weight", "down_proj.weight"]:
-                    # Special Scaled Initialization --> There are 2 Layer Norms per Transformer Block
-                    # Following Pytorch init, except scale by 1/sqrt(2 * n_layer)
-                    # We need to reinit p since this code could be called multiple times
-                    # Having just p *= scale would repeatedly scale it down
                     with torch.no_grad():
                         p /= math.sqrt(num_residuals_per_layer * self.config.num_hidden_layers)
 
 
 class TransformerModel(TransformerPreTrainedModel):
 
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig350M):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -441,7 +400,7 @@ class TransformerModel(TransformerPreTrainedModel):
 class TransformerForCausalLM(TransformerPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig350M):
         super().__init__(config)
 
         self.model = TransformerModel(config)
